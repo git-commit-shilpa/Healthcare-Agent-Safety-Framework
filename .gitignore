@@ -1,0 +1,23 @@
+# Environment files may contain credentials.
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Frontend
+node_modules/
+frontend/dist/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editor and operating system
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db

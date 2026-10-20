@@ -1,0 +1,75 @@
+Hi everyone!
+
+Just wanted to give you a quick overview of the **Supabase database** I've created for our Healthcare Agent Safety Framework project, so you know which tables are available and how they connect to your respective roles.
+
+I've created **7 tables in Supabase**, which we'll all be using for our modules.
+
+**1. `users` — User Management**
+- Stores user information such as name, email, and assigned role.
+- Supports Admin, Patient, Physician, and Technician.
+- Connected to our authentication system.
+
+**2. `patients` — Patient Information**
+- Stores patient details such as age, medical condition, and treatment.
+- Each patient record is linked to a user.
+- Patients should access only their own records, while Physicians and Technicians have access based on their permissions and assignments.
+
+**3. `patient_assignments` — Patient–Staff Assignments**
+- Connects Physicians and Technicians to their assigned patients.
+- This is important for role-based access control.
+- For example, a Physician should only be able to access records of patients assigned to them.
+
+**4. `permissions` — Role-Based Access Control (RBAC)**
+- Defines the actions each role is allowed or not allowed to perform.
+- Contains the role, action, and whether the action is permitted.
+- These permissions will be checked by our backend guardrails before allowing an action.
+
+**5. `ai_requests` — AI Requests and Guardrail Decisions**
+- Stores actions requested through the AI agent.
+- Records the decision as **Allow, Block, or Escalate**, along with the reason.
+- For example, if a Patient requests another patient's records, the guardrail should block that request.
+- This is one of the main tables supporting our AI safety framework.
+
+**6. `approvals` — Human-in-the-Loop**
+- Stores AI requests that require human review.
+- Tracks whether the request is Pending, Approved, or Rejected.
+- For example, sensitive medical-record modifications may require Physician approval before execution.
+
+**7. `audit_logs` — Security Audit Trail**
+- Records important system activities and security events.
+- Includes guardrail decisions, account-management activities, and other recorded actions.
+- Helps us demonstrate continuous auditing and traceability.
+
+**Which tables are relevant to each role?**
+
+- **Patient:** `users`, `patients`, `permissions`, `ai_requests`
+- **Physician:** `users`, `patients`, `patient_assignments`, `permissions`, `ai_requests`, `approvals`
+- **Technician:** `users`, `patient_assignments`, `permissions`, `ai_requests`
+- **Admin:** `users`, `patient_assignments`, `permissions`, `ai_requests`, `approvals`, `audit_logs`
+
+These are the main tables each module will interact with, but actual access must be restricted according to the user's role and permissions.
+
+**How everything works together:**
+
+For example, if a Physician asks the AI to retrieve a patient's records:
+
+1. The system identifies the Physician using `users`.
+2. It checks the allowed actions in `permissions`.
+3. It verifies the patient assignment using `patient_assignments`.
+4. If authorized, the requested information is retrieved from `patients`.
+5. The AI request and guardrail decision are recorded in `ai_requests`.
+6. If human approval is required, it is managed through `approvals`.
+7. Relevant security activity is recorded in `audit_logs`.
+
+This is the overall flow we're trying to build across all four roles.
+
+**A few important points:**
+- Please reuse these existing tables wherever possible rather than creating separate databases.
+- Use the existing role and permission structure when implementing your modules.
+- The tables are created, but the complete guardrail and approval workflows still need to be implemented and integrated.
+- Use fictional patient data only.
+- If your module needs additional columns or tables, let's discuss them before modifying the shared database.
+
+The goal is for all four modules to work together, with **RBAC, AI Guardrails, Human-in-the-Loop authorization, and Continuous Auditing** forming the core of our project.
+
+Please refer to the existing database structure while developing your respective roles so integration will be easier later!

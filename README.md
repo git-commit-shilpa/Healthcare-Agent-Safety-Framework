@@ -152,6 +152,13 @@ response includes the permission-filtered overview to avoid a second
 authentication round trip before the dashboard can display. While the app
 remains open, auth events for the same signed-in user update the token without
 reloading dashboard state or making another bootstrap request.
+Admin sessions end after 10 minutes without trusted keyboard, pointer, touch,
+or scroll activity in the visible tab. FastAPI separately checks its
+single-process in-memory session record on authenticated requests and rejects
+expired sessions even if a Supabase access token remains valid. After a backend
+restart, an Admin must sign in again; an existing session without a fresh
+password-authentication timestamp is rejected. Patient, Physician, and
+Technician sessions do not use this Admin inactivity timeout.
 
 On the Admin page, the four data sections load through one permission-checked
 overview request; FastAPI fetches the sections concurrently and skips any
@@ -181,8 +188,11 @@ their own account. AI responses exclude `patient_id`,
 `requested_by`, `request_details`, and `decision_reason`. Audit responses
 exclude `user_id` and free-text `details`. Each list is bounded and paginated
 by the API; the dashboard displays the first page only. No patient medical
-record endpoint is provided to Admin. Keep future Admin features behind
-backend permission checks; frontend route guards are not authorization.
+record endpoint is provided to Admin. Every `/api/admin/*` endpoint requires
+the role linked to the authenticated user in `public.users` to be Admin, and
+continues to enforce its action-specific permissions. Keep future Admin
+features behind backend authorization; frontend route guards are not
+authorization.
 
 ## Admin AI request analysis
 

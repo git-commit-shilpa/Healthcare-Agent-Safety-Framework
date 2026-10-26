@@ -1,9 +1,13 @@
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import math
 import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, AsyncGenerator, Awaitable, Callable, Literal
@@ -15,7 +19,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, PrivateAttr
 
 from app.ai_request_analysis import (
     OllamaResponseError,
@@ -32,6 +36,17 @@ from app.ai_audit_log_analysis import (
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 logger = logging.getLogger(__name__)
+ADMIN_SESSION_IDLE_TIMEOUT_SECONDS = 10 * 60
+ADMIN_SESSION_PROCESS_STARTED_AT = time.time()
+
+
+@dataclass
+class AdminSessionState:
+    last_activity: float
+    expired: bool = False
+
+
+admin_sessions: dict[str, AdminSessionState] = {}
 
 
 @asynccontextmanager
@@ -79,6 +94,8 @@ class CurrentUser(BaseModel):
     email: str
     role: Role
     permissions: list[str]
+    _admin_session_key: str | None = PrivateAttr(default=None)
+    _password_auth_timestamp: float | None = PrivateAttr(default=None)
 
 
 class DashboardResponse(BaseModel):
@@ -232,6 +249,80 @@ def _service_role_key() -> str:
     return key
 
 
+def _validated_auth_claims(access_token: str) -> dict[str, Any]:
+    try:
+        payload = access_token.split(".")[1]
+        payload_bytes = base64.urlsafe_b64decode(
+            payload + "=" * (-len(payload) % 4)
+        )
+        claims = json.loads(payload_bytes)
+    except (IndexError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def _password_auth_timestamp(amr: Any) -> float | None:
+    if not isinstance(amr, list):
+        return None
+
+    timestamps: list[float] = []
+    for item in amr:
+        if (
+            not isinstance(item, dict)
+            or item.get("method") != "password"
+            or not isinstance(item.get("timestamp"), (int, float))
+            or isinstance(item.get("timestamp"), bool)
+        ):
+            continue
+        try:
+            timestamp = float(item["timestamp"])
+        except OverflowError:
+            continue
+        if math.isfinite(timestamp):
+            timestamps.append(timestamp)
+    return max(timestamps) if timestamps else None
+
+
+def _admin_session_expired() -> HTTPException:
+    return HTTPException(
+        status_code=401,
+        detail="Admin session expired. Sign in again.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _active_admin_session(user: CurrentUser) -> AdminSessionState:
+    session_key = user._admin_session_key
+    password_auth_timestamp = user._password_auth_timestamp
+    if session_key is None:
+        raise _admin_session_expired()
+
+    now_wall = time.time()
+    now_monotonic = time.monotonic()
+    session = admin_sessions.get(session_key)
+    if session is None:
+        if (
+            password_auth_timestamp is None
+            or password_auth_timestamp < ADMIN_SESSION_PROCESS_STARTED_AT
+            or password_auth_timestamp > now_wall + 30
+        ):
+            raise _admin_session_expired()
+
+        elapsed_since_authentication = max(0, now_wall - password_auth_timestamp)
+        session = AdminSessionState(
+            last_activity=now_monotonic - elapsed_since_authentication
+        )
+        admin_sessions[session_key] = session
+
+    if session.expired:
+        raise _admin_session_expired()
+    if now_monotonic - session.last_activity >= ADMIN_SESSION_IDLE_TIMEOUT_SECONDS:
+        session.expired = True
+        raise _admin_session_expired()
+
+    return session
+
+
 async def _verified_auth_user(access_token: str) -> dict[str, Any]:
     anon_key = os.getenv("SUPABASE_KEY", "")
     if not anon_key:
@@ -262,10 +353,21 @@ async def _verified_auth_user(access_token: str) -> dict[str, Any]:
     if not isinstance(email, str) or not email:
         raise HTTPException(status_code=403, detail="The authenticated account has no email address.")
 
-    return {"auth_user_id": str(auth_user_id), "email": email}
+    claims = _validated_auth_claims(access_token)
+    try:
+        session_id = str(UUID(claims["session_id"]))
+    except (KeyError, TypeError, ValueError):
+        session_id = None
+
+    return {
+        "auth_user_id": str(auth_user_id),
+        "email": email,
+        "session_id": session_id,
+        "password_auth_timestamp": _password_auth_timestamp(claims.get("amr")),
+    }
 
 
-async def _load_linked_user(auth_user: dict[str, str]) -> tuple[int, str]:
+async def _load_linked_user(auth_user: dict[str, Any]) -> tuple[int, str]:
     response = await _request_supabase(
         "/rest/v1/users",
         api_key=_service_role_key(),
@@ -371,17 +473,37 @@ async def get_current_user(
     )
     permissions = permissions_by_role.get(database_role.casefold(), [])
 
-    return CurrentUser(
+    current_user = CurrentUser(
         user_id=user_id,
         email=auth_user["email"],
         role=Role(database_role.casefold()),
         permissions=permissions,
     )
+    if current_user.role == Role.ADMIN:
+        session_id = auth_user.get("session_id")
+        if isinstance(session_id, str):
+            current_user._admin_session_key = hashlib.sha256(
+                f"{auth_user['auth_user_id']}:{session_id}".encode("utf-8")
+            ).hexdigest()
+        current_user._password_auth_timestamp = auth_user.get(
+            "password_auth_timestamp"
+        )
+        _active_admin_session(current_user)
+
+    return current_user
+
+
+async def require_admin(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> CurrentUser:
+    if user.role != Role.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin role is required.")
+    return user
 
 
 def require_permission(action: str):
     async def check_permission(
-        user: Annotated[CurrentUser, Depends(get_current_user)],
+        user: Annotated[CurrentUser, Depends(require_admin)],
     ) -> CurrentUser:
         if action not in user.permissions:
             raise HTTPException(status_code=403, detail="You do not have permission to perform this action.")
@@ -577,6 +699,24 @@ async def check_action_permission(
 ) -> AuthorizationResponse:
     allowed = action in user.permissions
     return AuthorizationResponse(action=action, allowed=allowed)
+
+
+@app.post("/api/admin/session/activity")
+async def record_admin_session_activity(
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict[str, bool]:
+    session = _active_admin_session(user)
+    session.last_activity = time.monotonic()
+    return {"active": True}
+
+
+@app.post("/api/admin/session/logout")
+async def end_admin_session(
+    user: Annotated[CurrentUser, Depends(require_admin)],
+) -> dict[str, bool]:
+    session = _active_admin_session(user)
+    session.expired = True
+    return {"signed_out": True}
 
 
 @app.get("/api/admin/user-management/access")
@@ -1094,7 +1234,7 @@ async def analyze_admin_audit_logs(
 
 @app.get("/api/admin/overview", response_model=AdminOverviewResponse)
 async def get_admin_overview(
-    user: Annotated[CurrentUser, Depends(get_current_user)],
+    user: Annotated[CurrentUser, Depends(require_admin)],
 ) -> AdminOverviewResponse:
     return await _build_admin_overview(user)
 

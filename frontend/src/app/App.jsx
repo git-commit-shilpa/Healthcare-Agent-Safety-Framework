@@ -15,11 +15,32 @@ import {
   useParams,
 } from "react-router-dom";
 import { supabase } from "../shared/supabase.js";
+import {
+  ADMIN_IDLE_TIMEOUT_MS,
+  createAdminIdleTimer,
+} from "../shared/adminIdleTimer.js";
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
 const roles = ["admin", "patient", "physician", "technician"];
+const adminSessionExpiredMessage = "Admin session expired. Sign in again.";
+const adminSessionExpiredEvent = "admin-session-expired";
 const authContext = createContext(null);
 const pendingGetRequests = new Map();
+
+async function readApiResponse(response, { notifyAdminExpiry = true } = {}) {
+  const result = await response.json();
+  if (!response.ok) {
+    if (
+      notifyAdminExpiry &&
+      response.status === 401 &&
+      result.detail === adminSessionExpiredMessage
+    ) {
+      window.dispatchEvent(new Event(adminSessionExpiredEvent));
+    }
+    throw new Error(result.detail || `Request failed with status ${response.status}.`);
+  }
+  return result;
+}
 
 function getApiJson(path, accessToken) {
   const requestKey = `${path}:${accessToken}`;
@@ -29,13 +50,7 @@ function getApiJson(path, accessToken) {
   const request = fetch(`${apiBaseUrl}${path}`, {
     headers: { Authorization: `Bearer ${accessToken}` },
   })
-    .then(async (response) => {
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.detail || `Could not load ${path}.`);
-      }
-      return result;
-    });
+    .then(readApiResponse);
 
   let sharedRequest;
   sharedRequest = request.finally(() => {
@@ -56,6 +71,7 @@ function AuthProvider({ children }) {
     error: "",
   });
   const authRef = useRef(auth);
+  const logoutRef = useRef(null);
   authRef.current = auth;
 
   useEffect(() => {
@@ -138,11 +154,131 @@ function AuthProvider({ children }) {
       void loadAccount(session);
     });
 
+    function handleAdminSessionExpired() {
+      setAuth({
+        status: "signed-out",
+        session: null,
+        user: null,
+        adminOverview: null,
+        error: "",
+      });
+      void supabase.auth.signOut({ scope: "local" }).then(
+        ({ error }) => {
+          if (error) console.error("Could not clear the expired local session.", error);
+        },
+        (error) => console.error("Could not clear the expired local session.", error),
+      );
+    }
+
+    window.addEventListener(adminSessionExpiredEvent, handleAdminSessionExpired);
+
     return () => {
       active = false;
+      window.removeEventListener(adminSessionExpiredEvent, handleAdminSessionExpired);
       subscription.unsubscribe();
     };
   }, []);
+
+  useEffect(() => {
+    if (
+      auth.status !== "ready" ||
+      auth.user?.role !== "admin" ||
+      !auth.session
+    ) {
+      return undefined;
+    }
+
+    let active = true;
+    let lastActivitySignalAt = Number.NEGATIVE_INFINITY;
+    let queuedActivitySignal = null;
+    const timer = createAdminIdleTimer(() => {
+      const endSession = logoutRef.current;
+      if (endSession) {
+        const accessToken = authRef.current.session?.access_token;
+        if (accessToken) {
+          void fetch(`${apiBaseUrl}/admin/session/logout`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${accessToken}` },
+          })
+            .then((response) =>
+              readApiResponse(response, { notifyAdminExpiry: false }),
+            )
+            .catch((error) => {
+              console.error("Could not end the idle Admin session on the backend.", error);
+            });
+        }
+        void endSession({ bestEffort: true }).catch((error) => {
+          console.error("Could not clear the idle Admin session.", error);
+          setAuth({
+            status: "signed-out",
+            session: null,
+            user: null,
+            adminOverview: null,
+            error: "",
+          });
+        });
+      }
+    });
+
+    async function recordActivity() {
+      const accessToken = authRef.current.session?.access_token;
+      if (!accessToken) return;
+
+      try {
+        const response = await fetch(`${apiBaseUrl}/admin/session/activity`, {
+          method: "POST",
+          headers: { Authorization: "Bearer " + accessToken },
+        });
+        await readApiResponse(response);
+      } catch (error) {
+        if (active) console.error("Could not record Admin activity.", error);
+      }
+    }
+
+    function handleInteraction(event) {
+      if (!event.isTrusted || document.visibilityState !== "visible") return;
+      if (!timer.reset()) return;
+
+      const now = Date.now();
+      if (now - lastActivitySignalAt >= 1000) {
+        if (queuedActivitySignal !== null) {
+          clearTimeout(queuedActivitySignal);
+          queuedActivitySignal = null;
+        }
+        lastActivitySignalAt = now;
+        void recordActivity();
+      } else {
+        if (queuedActivitySignal !== null) clearTimeout(queuedActivitySignal);
+        queuedActivitySignal = setTimeout(() => {
+          queuedActivitySignal = null;
+          if (active && document.visibilityState === "visible") {
+            lastActivitySignalAt = Date.now();
+            void recordActivity();
+          }
+        }, 1000 - (now - lastActivitySignalAt));
+      }
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === "visible") timer.check();
+    }
+
+    const activityEvents = ["pointerdown", "keydown", "touchstart", "wheel"];
+    for (const eventName of activityEvents) {
+      document.addEventListener(eventName, handleInteraction, { passive: true });
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      active = false;
+      timer.dispose();
+      if (queuedActivitySignal !== null) clearTimeout(queuedActivitySignal);
+      for (const eventName of activityEvents) {
+        document.removeEventListener(eventName, handleInteraction);
+      }
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [auth.status, auth.user?.role, auth.session?.user.id]);
 
   async function login(email, password) {
     if (!supabase) {
@@ -152,11 +288,30 @@ function AuthProvider({ children }) {
     if (error) throw error;
   }
 
-  async function logout() {
+  async function logout({ bestEffort = false } = {}) {
     if (!supabase) return;
-    const { error } = await supabase.auth.signOut();
+    const currentAuth = authRef.current;
+    const isAdmin = currentAuth.user?.role === "admin";
+    let backendLogoutError = null;
+    if (isAdmin && currentAuth.session?.access_token && !bestEffort) {
+      try {
+        const response = await fetch(`${apiBaseUrl}/admin/session/logout`, {
+          method: "POST",
+          headers: { Authorization: "Bearer " + currentAuth.session.access_token },
+        });
+        await readApiResponse(response, { notifyAdminExpiry: false });
+      } catch (error) {
+        backendLogoutError = error;
+      }
+    }
+
+    const { error } = isAdmin
+      ? await supabase.auth.signOut({ scope: "local" })
+      : await supabase.auth.signOut();
     if (error) throw error;
+    if (backendLogoutError && !bestEffort) throw backendLogoutError;
   }
+  logoutRef.current = logout;
 
   return (
     <authContext.Provider value={{ ...auth, login, logout }}>
@@ -567,10 +722,7 @@ function AdminDashboard({ user, session, onLogout, initialOverview }) {
         },
         body: JSON.stringify(inviteForm),
       });
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.detail || "Could not invite this user.");
-      }
+      const result = await readApiResponse(response);
       setInviteStatus(`Invitation sent to ${result.email}. They can set a password from the email link.`);
       setInviteForm({ name: "", email: "", role: "patient" });
       void refreshPanels();
@@ -603,10 +755,7 @@ function AdminDashboard({ user, session, onLogout, initialOverview }) {
         method: "POST",
         headers: { Authorization: "Bearer " + accessToken },
       });
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.detail || "Could not deactivate this account.");
-      }
+      const result = await readApiResponse(response);
       setDeactivationStatus(`${record.email} has been deactivated. The account and its history were preserved.`);
       await refreshPanels();
     } catch (error) {
@@ -641,10 +790,7 @@ function AdminDashboard({ user, session, onLogout, initialOverview }) {
         },
         body: JSON.stringify({ question: analysisQuestion }),
       });
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.detail || "Could not analyze AI request activity.");
-      }
+      const result = await readApiResponse(response);
       setAnalysisAnswer(result.answer);
       setAnalysisRecordCount(result.records_analyzed);
     } catch (error) {
@@ -677,10 +823,7 @@ function AdminDashboard({ user, session, onLogout, initialOverview }) {
         },
         body: JSON.stringify({ question: auditAnalysisQuestion }),
       });
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.detail || "Could not analyze audit log activity.");
-      }
+      const result = await readApiResponse(response);
       setAuditAnalysisResult(result);
     } catch (error) {
       setAuditAnalysisError(

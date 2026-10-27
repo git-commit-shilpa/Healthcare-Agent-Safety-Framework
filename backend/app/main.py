@@ -94,6 +94,7 @@ class CurrentUser(BaseModel):
     email: str
     role: Role
     permissions: list[str]
+    name: str | None = None
     _admin_session_key: str | None = PrivateAttr(default=None)
     _password_auth_timestamp: float | None = PrivateAttr(default=None)
 
@@ -186,6 +187,16 @@ class AdminOverviewResponse(BaseModel):
 class AuthBootstrapResponse(BaseModel):
     user: CurrentUser
     admin_overview: AdminOverviewResponse | None
+
+
+class PatientMedicalRecord(BaseModel):
+    age: int | None
+    medical_condition: str | None
+    treatment: str | None
+
+
+class PatientMedicalRecordResponse(BaseModel):
+    record: PatientMedicalRecord | None
 
 
 async def _request_supabase(
@@ -367,13 +378,13 @@ async def _verified_auth_user(access_token: str) -> dict[str, Any]:
     }
 
 
-async def _load_linked_user(auth_user: dict[str, Any]) -> tuple[int, str]:
+async def _load_linked_user(auth_user: dict[str, Any]) -> tuple[int, str, str | None]:
     response = await _request_supabase(
         "/rest/v1/users",
         api_key=_service_role_key(),
         bearer_token=_service_role_key(),
         params={
-            "select": "user_id,role,is_active",
+            "select": "user_id,name,role,is_active",
             "auth_user_id": f"eq.{auth_user['auth_user_id']}",
             "limit": "2",
         },
@@ -402,18 +413,25 @@ async def _load_linked_user(auth_user: dict[str, Any]) -> tuple[int, str]:
     try:
         user_id = int(rows[0]["user_id"])
         database_role = str(rows[0]["role"]).strip()
-        Role(database_role.casefold())
+        role = Role(database_role.casefold())
         is_active = rows[0]["is_active"]
         if not isinstance(is_active, bool):
             raise ValueError("Application account active status must be boolean.")
+        name = rows[0].get("name")
+        if role == Role.PATIENT and (
+            not isinstance(name, str) or not name.strip()
+        ):
+            raise ValueError("Patient account name must be a non-empty string.")
     except (KeyError, TypeError, ValueError) as error:
-        logger.error("The linked application account has an invalid id, role, or active status.")
+        logger.error(
+            "The linked application account has an invalid id, role, active status, or patient name."
+        )
         raise HTTPException(status_code=403, detail="The linked application account is invalid.") from error
 
     if not is_active:
         raise HTTPException(status_code=403, detail="This application account has been deactivated.")
 
-    return user_id, database_role
+    return user_id, database_role, name.strip() if isinstance(name, str) else None
 
 
 async def _load_permissions() -> dict[str, list[str]]:
@@ -467,7 +485,7 @@ async def get_current_user(
         )
 
     auth_user = await _verified_auth_user(credentials.credentials)
-    (user_id, database_role), permissions_by_role = await asyncio.gather(
+    (user_id, database_role, name), permissions_by_role = await asyncio.gather(
         _load_linked_user(auth_user),
         _load_permissions(),
     )
@@ -478,6 +496,7 @@ async def get_current_user(
         email=auth_user["email"],
         role=Role(database_role.casefold()),
         permissions=permissions,
+        name=name if database_role.casefold() == Role.PATIENT.value else None,
     )
     if current_user.role == Role.ADMIN:
         session_id = auth_user.get("session_id")
@@ -510,6 +529,14 @@ def require_permission(action: str):
         return user
 
     return check_permission
+
+
+async def require_patient(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> CurrentUser:
+    if user.role != Role.PATIENT:
+        raise HTTPException(status_code=403, detail="Patient role is required.")
+    return user
 
 
 async def _admin_table_rows(
@@ -689,6 +716,107 @@ async def get_role_dashboard(
     return DashboardResponse(
         role=user.role,
         message=f"Welcome. The {user.role.value.title()} workspace is ready for its module.",
+    )
+
+
+@app.get(
+    "/api/patient/my-record",
+    response_model=PatientMedicalRecordResponse,
+)
+async def get_patient_medical_record(
+    user: Annotated[CurrentUser, Depends(require_patient)],
+) -> PatientMedicalRecordResponse:
+    try:
+        service_key = _service_role_key()
+        response = await _request_supabase(
+            "/rest/v1/patients",
+            api_key=service_key,
+            bearer_token=service_key,
+            params={
+                "select": "age,medical_condition,treatment",
+                "user_id": f"eq.{user.user_id}",
+                "limit": "2",
+            },
+        )
+    except HTTPException as error:
+        logger.error(
+            "Patient medical-record lookup failed before receiving a Supabase response (HTTP %s).",
+            error.status_code,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Medical records are temporarily unavailable.",
+        ) from error
+    except httpx.HTTPError as error:
+        logger.error(
+            "Patient medical-record lookup encountered a Supabase transport failure (%s).",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Medical records are temporarily unavailable.",
+        ) from error
+
+    if not response.is_success:
+        logger.error(
+            "Patient medical-record lookup returned HTTP %s.",
+            response.status_code,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Medical records are temporarily unavailable.",
+        )
+
+    try:
+        rows = response.json()
+    except ValueError as error:
+        logger.error("Supabase returned invalid patient medical-record data.")
+        raise HTTPException(
+            status_code=502,
+            detail="Patient medical-record data is invalid.",
+        ) from error
+
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        logger.error("Supabase returned an invalid patient medical-record result.")
+        raise HTTPException(
+            status_code=502,
+            detail="Patient medical-record data is invalid.",
+        )
+    if len(rows) > 1:
+        logger.error(
+            "Multiple patient medical records are linked to application user %s.",
+            user.user_id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Multiple medical records are linked to this account.",
+        )
+    if not rows:
+        return PatientMedicalRecordResponse(record=None)
+
+    row = rows[0]
+    age = row.get("age")
+    medical_condition = row.get("medical_condition")
+    treatment = row.get("treatment")
+    if (
+        age is not None
+        and (not isinstance(age, int) or isinstance(age, bool))
+    ) or any(
+        value is not None and not isinstance(value, str)
+        for value in (medical_condition, treatment)
+    ):
+        logger.error("Supabase returned invalid patient medical-record fields.")
+        raise HTTPException(
+            status_code=502,
+            detail="Patient medical-record data is invalid.",
+        )
+
+    return PatientMedicalRecordResponse(
+        record=PatientMedicalRecord(
+            age=age,
+            medical_condition=medical_condition,
+            treatment=treatment,
+        )
     )
 
 

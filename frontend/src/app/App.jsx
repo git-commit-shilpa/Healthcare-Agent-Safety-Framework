@@ -15,6 +15,7 @@ import {
   useParams,
 } from "react-router-dom";
 import { supabase } from "../shared/supabase.js";
+import PatientDashboard from "../modules/patient/PatientDashboard.jsx";
 import {
   ADMIN_IDLE_TIMEOUT_MS,
   createAdminIdleTimer,
@@ -1338,6 +1339,18 @@ function RoleDashboard() {
         session={session}
         onLogout={handleLogout}
         initialOverview={adminOverview}
+      />
+    );
+  }
+
+  if (user.role === "patient") {
+    return (
+      <PatientDashboard
+        user={user}
+        session={session}
+        dashboardError={dashboardError}
+        onLogout={handleLogout}
+        signOutError={signOutError}
       />
     );
   }

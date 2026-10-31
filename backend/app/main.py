@@ -16,7 +16,7 @@ from uuid import UUID
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field, PrivateAttr
@@ -197,6 +197,62 @@ class PatientMedicalRecord(BaseModel):
 
 class PatientMedicalRecordResponse(BaseModel):
     record: PatientMedicalRecord | None
+
+
+class PatientCorrectionRequestResponse(BaseModel):
+    request_id: int
+    guardrail_decision: Literal["Allow", "Block", "Escalate"]
+    approval_status: Literal["Pending", "Approved", "Rejected"]
+
+
+CorrectionStatusIssue = Literal[
+    "missing_approval",
+    "multiple_approvals",
+    "invalid_approval_status",
+    "invalid_guardrail_decision",
+    "review_timestamp_mismatch",
+]
+
+
+class PatientCorrectionHistoryItem(BaseModel):
+    request_id: int
+    created_at: str | None
+    guardrail_decision: Literal["Allow", "Block", "Escalate"] | None
+    approval_status: Literal["Pending", "Approved", "Rejected"] | None
+    reviewed_at: str | None
+    # Set when the stored records are inconsistent; the request is then shown
+    # as needing attention instead of being given an assumed status.
+    status_issue: CorrectionStatusIssue | None = None
+
+
+class PatientCorrectionHistoryResponse(BaseModel):
+    items: list[PatientCorrectionHistoryItem]
+
+
+PATIENT_CORRECTION_ACTION = "patient_treatment_correction"
+PATIENT_CORRECTION_HISTORY_LIMIT = 50
+PATIENT_CORRECTION_PRECHECK_LIMIT = 1000
+VALID_GUARDRAIL_DECISIONS = {"allow": "Allow", "block": "Block", "escalate": "Escalate"}
+VALID_APPROVAL_STATUSES = {"Pending", "Approved", "Rejected"}
+CORRECTION_HISTORY_UNAVAILABLE_DETAIL = (
+    "Your correction request history is temporarily unavailable."
+)
+CORRECTION_UNAVAILABLE_DETAIL = "Correction requests are temporarily unavailable."
+CORRECTION_UNCONFIRMED_DETAIL = (
+    "We could not confirm whether your correction request was submitted. "
+    "Do not submit it again yet; check your request history first."
+)
+# Transport failures raised before the RPC request reaches Supabase. Any other
+# transport failure may occur after PostgreSQL has committed the transaction.
+CORRECTION_NOT_SENT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.UnsupportedProtocol,
+)
+# Gateway statuses returned without a database error code when the upstream
+# outcome is unknown.
+CORRECTION_UNCONFIRMED_GATEWAY_STATUSES = {502, 504, 520, 524}
 
 
 async def _request_supabase(
@@ -817,6 +873,425 @@ async def get_patient_medical_record(
             medical_condition=medical_condition,
             treatment=treatment,
         )
+    )
+
+
+async def _patient_service_rows(
+    table: str,
+    params: dict[str, str],
+    *,
+    unavailable_detail: str,
+) -> list[dict[str, Any]]:
+    try:
+        service_key = _service_role_key()
+        response = await _request_supabase(
+            f"/rest/v1/{table}",
+            api_key=service_key,
+            bearer_token=service_key,
+            params=params,
+        )
+    except (HTTPException, httpx.HTTPError) as error:
+        cause = error.__cause__ if isinstance(error, HTTPException) else error
+        logger.error(
+            "Patient %s lookup failed before receiving a Supabase response (%s).",
+            table,
+            type(cause or error).__name__,
+        )
+        raise HTTPException(status_code=503, detail=unavailable_detail) from error
+
+    if not response.is_success:
+        logger.error(
+            "Patient %s lookup returned HTTP %s.",
+            table,
+            response.status_code,
+        )
+        raise HTTPException(status_code=503, detail=unavailable_detail)
+
+    try:
+        rows = response.json()
+    except ValueError as error:
+        logger.error("Supabase returned invalid patient %s data.", table)
+        raise HTTPException(status_code=502, detail=unavailable_detail) from error
+
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        logger.error("Supabase returned an invalid patient %s result.", table)
+        raise HTTPException(status_code=502, detail=unavailable_detail)
+    return rows
+
+
+def _is_strict_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+async def _load_own_correction_requests(
+    user_id: int,
+    *,
+    limit: int,
+    unavailable_detail: str,
+) -> list[dict[str, Any]]:
+    # The requester filter comes only from the verified CurrentUser. The
+    # proposed value (request_details) and decision_reason are never selected.
+    rows = await _patient_service_rows(
+        "ai_requests",
+        {
+            "select": "request_id,requested_by,guardrail_decision,created_at",
+            "requested_by": f"eq.{user_id}",
+            "action": f"eq.{PATIENT_CORRECTION_ACTION}",
+            "order": "created_at.desc,request_id.desc",
+            "limit": str(limit),
+        },
+        unavailable_detail=unavailable_detail,
+    )
+    for row in rows:
+        if (
+            not _is_strict_int(row.get("request_id"))
+            or row.get("requested_by") != user_id
+            or not isinstance(row.get("created_at"), (str, type(None)))
+        ):
+            logger.error("Supabase returned an invalid or foreign correction request row.")
+            raise HTTPException(status_code=502, detail=unavailable_detail)
+    return rows
+
+
+async def _load_correction_approvals(
+    request_ids: list[int],
+    *,
+    unavailable_detail: str,
+) -> dict[int, list[dict[str, Any]]]:
+    if not request_ids:
+        return {}
+    # reviewer_id is intentionally not selected.
+    rows = await _patient_service_rows(
+        "approvals",
+        {
+            "select": "request_id,status,reviewed_at",
+            "request_id": f"in.({','.join(str(request_id) for request_id in request_ids)})",
+        },
+        unavailable_detail=unavailable_detail,
+    )
+    approvals: dict[int, list[dict[str, Any]]] = {}
+    requested = set(request_ids)
+    for row in rows:
+        request_id = row.get("request_id")
+        if not _is_strict_int(request_id) or request_id not in requested:
+            logger.error("Supabase returned an invalid or unrelated approval row.")
+            raise HTTPException(status_code=502, detail=unavailable_detail)
+        approvals.setdefault(request_id, []).append(row)
+    return approvals
+
+
+def _correction_history_item(
+    request: dict[str, Any],
+    approvals: list[dict[str, Any]],
+) -> PatientCorrectionHistoryItem:
+    issue: CorrectionStatusIssue | None = None
+
+    decision_value = request.get("guardrail_decision")
+    guardrail_decision = (
+        VALID_GUARDRAIL_DECISIONS.get(decision_value.casefold())
+        if isinstance(decision_value, str)
+        else None
+    )
+    if guardrail_decision is None:
+        issue = "invalid_guardrail_decision"
+
+    approval_status: str | None = None
+    reviewed_at: str | None = None
+    if not approvals:
+        issue = issue or "missing_approval"
+    elif len(approvals) > 1:
+        issue = issue or "multiple_approvals"
+    else:
+        approval = approvals[0]
+        status = approval.get("status")
+        reviewed_value = approval.get("reviewed_at")
+        if status not in VALID_APPROVAL_STATUSES or not isinstance(
+            reviewed_value, (str, type(None))
+        ):
+            issue = issue or "invalid_approval_status"
+        else:
+            approval_status = status
+            reviewed_at = reviewed_value
+            if (status == "Pending") != (reviewed_at is None):
+                issue = issue or "review_timestamp_mismatch"
+
+    if issue is not None:
+        logger.warning(
+            "Patient correction request %s has inconsistent records (%s).",
+            request["request_id"],
+            issue,
+        )
+
+    return PatientCorrectionHistoryItem(
+        request_id=request["request_id"],
+        created_at=request.get("created_at"),
+        guardrail_decision=guardrail_decision,
+        approval_status=approval_status,
+        reviewed_at=reviewed_at,
+        status_issue=issue,
+    )
+
+
+async def _blocking_correction_request_id(user_id: int) -> int | None:
+    """Return the newest own correction request that is not finally reviewed.
+
+    A request blocks a new submission when its approval is Pending, missing,
+    duplicated, or has an unrecognized status. This check improves the
+    Patient experience but is not race-free on its own; the database function
+    must enforce the same rule atomically.
+    """
+    requests = await _load_own_correction_requests(
+        user_id,
+        limit=PATIENT_CORRECTION_PRECHECK_LIMIT,
+        unavailable_detail=CORRECTION_UNAVAILABLE_DETAIL,
+    )
+    request_ids = [row["request_id"] for row in requests]
+    approvals = await _load_correction_approvals(
+        request_ids,
+        unavailable_detail=CORRECTION_UNAVAILABLE_DETAIL,
+    )
+    for request_id in request_ids:
+        request_approvals = approvals.get(request_id, [])
+        if len(request_approvals) != 1 or request_approvals[0].get("status") not in {
+            "Approved",
+            "Rejected",
+        }:
+            return request_id
+    return None
+
+
+@app.get(
+    "/api/patient/correction-requests",
+    response_model=PatientCorrectionHistoryResponse,
+)
+async def get_patient_correction_requests(
+    user: Annotated[CurrentUser, Depends(require_patient)],
+) -> PatientCorrectionHistoryResponse:
+    if "view_own_correction_requests" not in user.permissions:
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to view correction requests.",
+        )
+
+    requests = await _load_own_correction_requests(
+        user.user_id,
+        limit=PATIENT_CORRECTION_HISTORY_LIMIT,
+        unavailable_detail=CORRECTION_HISTORY_UNAVAILABLE_DETAIL,
+    )
+    approvals = await _load_correction_approvals(
+        [row["request_id"] for row in requests],
+        unavailable_detail=CORRECTION_HISTORY_UNAVAILABLE_DETAIL,
+    )
+    return PatientCorrectionHistoryResponse(
+        items=[
+            _correction_history_item(row, approvals.get(row["request_id"], []))
+            for row in requests
+        ]
+    )
+
+
+@app.post(
+    "/api/patient/correction-requests",
+    response_model=PatientCorrectionRequestResponse,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "proposed_treatment": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 2000,
+                            }
+                        },
+                        "required": ["proposed_treatment"],
+                        "additionalProperties": False,
+                    }
+                }
+            },
+        }
+    },
+)
+async def submit_patient_correction_request(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_patient)],
+) -> PatientCorrectionRequestResponse:
+    if "submit_record_correction" not in user.permissions:
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to submit correction requests.",
+        )
+
+    try:
+        body = await request.json()
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422,
+            detail="The correction request must contain valid JSON.",
+        ) from error
+
+    if (
+        not isinstance(body, dict)
+        or set(body) != {"proposed_treatment"}
+        or not isinstance(body.get("proposed_treatment"), str)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Provide only a proposed_treatment string.",
+        )
+
+    proposed_treatment = body["proposed_treatment"]
+    if (
+        not proposed_treatment.strip()
+        or len(proposed_treatment) > 2000
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="The proposed treatment must contain 1 to 2000 characters.",
+        )
+
+    # Fails closed: if existing requests cannot be checked, nothing is submitted.
+    blocking_request_id = await _blocking_correction_request_id(user.user_id)
+    if blocking_request_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Correction request #{blocking_request_id} is still awaiting "
+                "Physician review. You can submit a new correction after it "
+                "has been reviewed."
+            ),
+        )
+
+    try:
+        service_key = _service_role_key()
+        response = await _request_supabase(
+            "/rest/v1/rpc/submit_patient_treatment_correction",
+            api_key=service_key,
+            method="POST",
+            json_body={
+                "p_requested_by": user.user_id,
+                "p_proposed_treatment": proposed_treatment,
+            },
+            extra_headers={"Authorization": f"Bearer {service_key}"},
+        )
+    except (HTTPException, httpx.HTTPError) as error:
+        # _request_supabase wraps transport failures in an HTTPException.
+        transport_error = (
+            error.__cause__ if isinstance(error, HTTPException) else error
+        )
+        if isinstance(transport_error, httpx.RequestError) and not isinstance(
+            transport_error, CORRECTION_NOT_SENT_ERRORS
+        ):
+            logger.error(
+                "Patient correction RPC outcome is unconfirmed after a transport failure (%s).",
+                type(transport_error).__name__,
+            )
+            raise HTTPException(
+                status_code=504,
+                detail=CORRECTION_UNCONFIRMED_DETAIL,
+            ) from error
+
+        logger.error(
+            "Patient correction RPC request was not sent (%s).",
+            type(transport_error or error).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=CORRECTION_UNAVAILABLE_DETAIL,
+        ) from error
+
+    if not response.is_success:
+        error_code = ""
+        error_message = ""
+        try:
+            rpc_error = response.json()
+            if isinstance(rpc_error, dict):
+                code = rpc_error.get("code")
+                message = rpc_error.get("message")
+                if isinstance(code, str):
+                    error_code = code
+                if isinstance(message, str):
+                    error_message = message
+        except ValueError:
+            pass
+
+        logger.error(
+            "Patient correction RPC returned HTTP %s (database code %s).",
+            response.status_code,
+            error_code or "unavailable",
+        )
+        if (
+            not error_code
+            and response.status_code in CORRECTION_UNCONFIRMED_GATEWAY_STATUSES
+        ):
+            raise HTTPException(
+                status_code=504,
+                detail=CORRECTION_UNCONFIRMED_DETAIL,
+            )
+        if error_code == "PT409":
+            # Raised by the database function (migration 007) when a correction
+            # request for this Patient is already awaiting review.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A correction request is already awaiting Physician review. "
+                    "You can submit a new correction after it has been reviewed."
+                ),
+            )
+        if error_code == "22023":
+            raise HTTPException(
+                status_code=422,
+                detail="The correction request is invalid or does not change the current value.",
+            )
+        if error_code == "42501":
+            if error_message == (
+                "No unique active assigned Physician is authorized to review this request."
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="An authorized Physician is unavailable to review this request.",
+                )
+            raise HTTPException(
+                status_code=403,
+                detail="The correction request is not authorized.",
+            )
+        # A database error code means the RPC transaction was rolled back.
+        raise HTTPException(
+            status_code=503,
+            detail=CORRECTION_UNAVAILABLE_DETAIL,
+        )
+
+    # From here the RPC succeeded, so the request may have been recorded even
+    # if its confirmation cannot be validated.
+    try:
+        result = response.json()
+    except ValueError as error:
+        logger.error("Patient correction RPC returned invalid response data.")
+        raise HTTPException(
+            status_code=502,
+            detail=CORRECTION_UNCONFIRMED_DETAIL,
+        ) from error
+
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("request_id"), int)
+        or isinstance(result.get("request_id"), bool)
+        or result.get("guardrail_decision") != "Escalate"
+        or result.get("approval_status") != "Pending"
+    ):
+        logger.error("Patient correction RPC returned an unexpected response shape.")
+        raise HTTPException(
+            status_code=502,
+            detail=CORRECTION_UNCONFIRMED_DETAIL,
+        )
+
+    return PatientCorrectionRequestResponse(
+        request_id=result["request_id"],
+        guardrail_decision="Escalate",
+        approval_status="Pending",
     )
 
 

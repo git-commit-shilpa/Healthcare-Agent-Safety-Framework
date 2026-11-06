@@ -131,10 +131,16 @@ describe("each page shows only its own content", () => {
     }
   });
 
-  test("the patient assistant remains a placeholder", () => {
+  test("the patient assistant renders a chat with a composer and no correction controls", () => {
     const html = renderRoute("/dashboard/patient/assistant", patientAuth);
-    assert.match(html, /The assistant is not active yet/);
-    assert.doesNotMatch(html, /<textarea|<input/);
+    assert.match(html, /role="log"/);
+    assert.match(html, /<label[^>]*>Message the assistant<\/label>/);
+    assert.match(html, /Educational only/);
+    assert.match(html, /New Chat<\/button>/);
+    assert.match(html, /Start a physician-reviewed request/);
+    assert.match(html, /Hi! I can explain medical terms and general health topics/);
+    assert.doesNotMatch(html, /Confirm and submit|Proposed correction/, "no correction controls before an offer");
+    assert.doesNotMatch(html, /not active yet/);
   });
 });
 

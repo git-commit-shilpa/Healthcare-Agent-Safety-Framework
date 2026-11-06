@@ -35,7 +35,13 @@ async function readBody(response) {
 export async function patientRequest(
   path,
   accessToken,
-  { method = "GET", body, timeoutMs = PATIENT_GET_TIMEOUT_MS, fetchImpl = fetch } = {},
+  {
+    method = "GET",
+    body,
+    timeoutMs = PATIENT_GET_TIMEOUT_MS,
+    fetchImpl = fetch,
+    allowEmptyResponse = false,
+  } = {},
 ) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -61,6 +67,7 @@ export async function patientRequest(
 
   const { empty, data } = await readBody(response);
   if (response.ok) {
+    if (empty && allowEmptyResponse) return null;
     if (data === null) {
       throw new PatientApiError("The server returned an invalid response.", {
         kind: "invalid",
@@ -92,6 +99,45 @@ export function getPatientRecord(accessToken, options) {
 
 export function getCorrectionRequests(accessToken, options) {
   return patientRequest("/patient/correction-requests", accessToken, options);
+}
+
+export const ASSISTANT_CHAT_TIMEOUT_MS = 100_000;
+
+export function sendAssistantMessage(accessToken, message, stateToken, options = {}) {
+  const { chatId, turnId, isNewChat = false, ...requestOptions } = options;
+  const body = stateToken ? { message, state_token: stateToken } : { message };
+  if (chatId !== undefined || turnId !== undefined) {
+    if (typeof chatId !== "string" || typeof turnId !== "string") {
+      throw new TypeError("Both chatId and turnId are required for chat history.");
+    }
+    body.chat_id = chatId;
+    body.turn_id = turnId;
+  }
+  if (isNewChat) body.is_new_chat = true;
+  return patientRequest("/patient/assistant/chat", accessToken, {
+    method: "POST",
+    body,
+    timeoutMs: ASSISTANT_CHAT_TIMEOUT_MS,
+    ...requestOptions,
+  });
+}
+
+export function reviewAssistantCorrection(accessToken, proposedTreatment, stateToken, options) {
+  return patientRequest("/patient/assistant/correction/review", accessToken, {
+    method: "POST",
+    body: { proposed_treatment: proposedTreatment, state_token: stateToken },
+    timeoutMs: PATIENT_SUBMIT_TIMEOUT_MS,
+    ...options,
+  });
+}
+
+export function confirmAssistantCorrection(accessToken, proposedTreatment, stateToken, options) {
+  return patientRequest("/patient/assistant/correction/confirm", accessToken, {
+    method: "POST",
+    body: { proposed_treatment: proposedTreatment, state_token: stateToken },
+    timeoutMs: PATIENT_SUBMIT_TIMEOUT_MS,
+    ...options,
+  });
 }
 
 export function submitTreatmentCorrection(accessToken, proposedTreatment, options) {

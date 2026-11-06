@@ -16,11 +16,23 @@ from uuid import UUID
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field, PrivateAttr
 
+from app.action_gateway import ASSISTANT_PERMISSION, IntentProposal, decide, explain, parse_proposal
+from app import chat_history, chat_state, safety_rules
+from app.patient_chat import (
+    RECORD_MISSING_REPLY,
+    RECORD_UNAVAILABLE_REPLY,
+    ChatUnavailableError,
+    canned_reply,
+    converse,
+    record_reply,
+)
+from app.intent_recognizer import MAX_QUESTION_CHARS, RecognizerUnavailableError, recognize_intent
 from app.ai_request_analysis import (
     OllamaResponseError,
     OllamaUnavailableError,
@@ -49,15 +61,47 @@ class AdminSessionState:
 admin_sessions: dict[str, AdminSessionState] = {}
 
 
+# The local model unloads after a few idle minutes and a cold load takes about a minute, which
+# is most of a chat turn's time budget. Load it at startup and keep it loaded.
+OLLAMA_WARM_INTERVAL_SECONDS = 240
+OLLAMA_KEEP_ALIVE = "30m"
+
+
+async def _warm_ollama_once() -> bool:
+    base = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
+            # An empty prompt only loads the model; nothing is generated or sent from a patient.
+            response = await client.post(
+                f"{base}/api/generate", json={"model": model, "prompt": "", "keep_alive": OLLAMA_KEEP_ALIVE}
+            )
+        return response.is_success
+    except httpx.HTTPError as error:
+        logger.warning("Ollama warm-up failed (%s).", type(error).__name__)
+        return False
+
+
+async def _keep_ollama_warm() -> None:
+    try:
+        while True:
+            await _warm_ollama_once()
+            await asyncio.sleep(OLLAMA_WARM_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     application.state.supabase_client = httpx.AsyncClient(
         timeout=httpx.Timeout(8.0),
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     )
+    warm_task = asyncio.create_task(_keep_ollama_warm())
     try:
         yield
     finally:
+        warm_task.cancel()
         await application.state.supabase_client.aclose()
 
 
@@ -72,7 +116,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -96,6 +140,7 @@ class CurrentUser(BaseModel):
     permissions: list[str]
     name: str | None = None
     _admin_session_key: str | None = PrivateAttr(default=None)
+    _session_key: str | None = PrivateAttr(default=None)
     _password_auth_timestamp: float | None = PrivateAttr(default=None)
 
 
@@ -554,6 +599,11 @@ async def get_current_user(
         permissions=permissions,
         name=name if database_role.casefold() == Role.PATIENT.value else None,
     )
+    login_session_id = auth_user.get("session_id")
+    if isinstance(login_session_id, str):
+        current_user._session_key = hashlib.sha256(
+            f"{auth_user['auth_user_id']}:{login_session_id}".encode("utf-8")
+        ).hexdigest()
     if current_user.role == Role.ADMIN:
         session_id = auth_user.get("session_id")
         if isinstance(session_id, str):
@@ -782,6 +832,12 @@ async def get_role_dashboard(
 async def get_patient_medical_record(
     user: Annotated[CurrentUser, Depends(require_patient)],
 ) -> PatientMedicalRecordResponse:
+    return await _load_own_record(user)
+
+
+async def _load_own_record(user: CurrentUser) -> PatientMedicalRecordResponse:
+    """The authenticated patient's own record. The user_id comes from the verified account,
+    never from the client or a model. Shared by the REST endpoint and the chat assistant."""
     try:
         service_key = _service_role_key()
         response = await _request_supabase(
@@ -1143,7 +1199,18 @@ async def submit_patient_correction_request(
             detail="Provide only a proposed_treatment string.",
         )
 
-    proposed_treatment = body["proposed_treatment"]
+    return await _submit_correction(user, body["proposed_treatment"])
+
+
+async def _submit_correction(
+    user: CurrentUser, proposed_treatment: str
+) -> PatientCorrectionRequestResponse:
+    """The single correction write pathway (direct form and assistant confirm both use it)."""
+    if user.role != Role.PATIENT or "submit_record_correction" not in user.permissions:
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to submit correction requests.",
+        )
     if (
         not proposed_treatment.strip()
         or len(proposed_treatment) > 2000
@@ -1293,6 +1360,728 @@ async def submit_patient_correction_request(
         guardrail_decision="Escalate",
         approval_status="Pending",
     )
+
+
+class PatientIntentRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+
+
+class PatientIntentResponse(BaseModel):
+    intent: str
+    decision: Literal["Allow", "Block", "Escalate"]
+    reason_code: str
+
+
+@app.post("/api/patient/assistant/intent", response_model=PatientIntentResponse)
+async def classify_patient_intent(
+    payload: PatientIntentRequest,
+    user: Annotated[CurrentUser, Depends(require_patient)],
+) -> PatientIntentResponse:
+    """Dry run: the model proposes an intent; the gateway decides. Nothing is executed or stored."""
+    if ASSISTANT_PERMISSION not in user.permissions:
+        raise HTTPException(status_code=403, detail="You do not have permission to use the assistant.")
+    try:
+        recognition = await recognize_intent(payload.question)
+    except RecognizerUnavailableError as error:
+        raise HTTPException(status_code=503, detail="The assistant is unavailable right now.") from error
+    result = decide(
+        role=user.role.value,
+        permissions=user.permissions,
+        proposal=parse_proposal(recognition.text),
+        rails_passed=recognition.rails_passed,
+    )
+    return PatientIntentResponse(intent=result.intent, decision=result.decision, reason_code=result.reason_code)
+
+
+class PatientChatRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    message: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+    state_token: str | None = Field(default=None, max_length=chat_state.MAX_TOKEN_CHARS)
+    # Optional chat-history fields (ignored unless HASF_CHAT_HISTORY_ENABLED=true).
+    chat_id: UUID | None = None
+    turn_id: UUID | None = None
+    is_new_chat: bool = False
+
+
+class PatientChatResponse(BaseModel):
+    reply: str
+    decision: Literal["Allow", "Block", "Escalate"]
+    intent: str
+    mode: Literal[
+        "answer", "refusal", "notice", "pointer", "greeting", "offer", "details_step", "cancelled",
+        "record",
+    ]
+    state_token: str | None = None
+    # Explainable decision: a stable code plus a plain-language reason (never message text).
+    reason_code: str | None = None
+    reason: str | None = None
+    # What happened to the patient's own data: none | retrieved | not_found | unavailable.
+    data_access: Literal["none", "retrieved", "not_found", "unavailable"] | None = None
+    # Added fields; existing clients read only reply/mode/state_token and ignore these.
+    chat_id: UUID | None = None
+    turn_id: UUID | None = None
+    save_status: Literal["saved", "duplicate", "not_saved", "unconfirmed", "disabled"] | None = None
+    save_reason: (
+        Literal[
+            "no_ids", "filtered", "not_eligible", "sensitive", "refused", "redacted",
+            "chat_unavailable", "chat_full", "chat_limit", "error",
+        ]
+        | None
+    ) = None
+
+
+# Shorter than the browser's chat wait (ASSISTANT_CHAT_TIMEOUT_MS = 100 s in patientApi.js).
+CHAT_TURN_BUDGET_SECONDS = 85
+
+CHAT_STATE_INVALID_DETAIL = "This conversation step is no longer valid. Please start again."
+CHAT_OFFER_REPLY = (
+    "I can't submit corrections from this chat, but I can help you raise a correction request "
+    "for your assigned Physician to review. Would you like to raise a correction request?"
+)
+CHAT_DETAILS_REPLY = (
+    "Okay. Please enter the proposed correction in the secure request-details box, not in this chat. "
+    "You'll see a review step and must confirm explicitly before anything is submitted. "
+    "Nothing has been submitted yet."
+)
+CHAT_DETAILS_WAITING_REPLY = (
+    "Please use the secure request-details box for the correction, or say cancel. "
+    "Nothing has been submitted."
+)
+CHAT_CANCELLED_REPLY = "Okay, I won't raise a correction request. Nothing was submitted."
+CHAT_NOTHING_PENDING_REPLY = "There's nothing waiting for a yes or no right now. What would you like to know?"
+
+
+def _chat_notice(reply: str, mode: str, intent: str, token: str | None = None) -> "PatientChatResponse":
+    return PatientChatResponse(reply=reply, decision="Escalate", intent=intent, mode=mode, state_token=token)
+
+
+async def _correction_offer_or_pending(user: CurrentUser) -> "PatientChatResponse":
+    """Offer help unless a correction already awaits review (the existing pre-check, fail closed)."""
+    blocking_id = await _blocking_correction_request_id(user.user_id)
+    if blocking_id is not None:
+        return _chat_notice(
+            f"Correction request #{blocking_id} is still awaiting Physician review, so another can't be "
+            "submitted until it is reviewed. You can follow it in AI Request History.",
+            "notice",
+            "request_correction",
+        )
+    return _chat_notice(
+        CHAT_OFFER_REPLY, "offer", "request_correction",
+        chat_state.issue_state(user.user_id, chat_state.STEP_OFFERED, session_key=user._session_key or ""),
+    )
+
+
+CHAT_CONFIRM_REPLY = (
+    "A chat reply can't submit a correction. To submit it, press Confirm on the review card, "
+    "or say cancel. Nothing has been submitted."
+)
+
+
+async def _chat_follow_up(payload: "PatientChatRequest", user: CurrentUser) -> "PatientChatResponse | None":
+    """Handle a message that carries a state token. None means: continue as a fresh message."""
+    session_key = user._session_key or ""
+    try:
+        step = chat_state.peek_state(payload.state_token, user.user_id, session_key=session_key)
+        reply = chat_state.interpret_reply(payload.message)
+        if step == chat_state.STEP_CONFIRM:
+            # Only the Confirm button (separate endpoint) can submit; chat can only cancel.
+            if reply in {"no", "cancel"}:
+                chat_state.consume_state(
+                    payload.state_token, user.user_id, session_key=session_key, ignore_hash=True
+                )
+                return _chat_notice(CHAT_CANCELLED_REPLY, "cancelled", "request_correction")
+            return _chat_notice(CHAT_CONFIRM_REPLY, "notice", "request_correction")
+        chat_state.consume_state(payload.state_token, user.user_id, session_key=session_key)
+    except chat_state.InvalidStateError as error:
+        raise HTTPException(status_code=409, detail=CHAT_STATE_INVALID_DETAIL) from error
+    if reply in {"no", "cancel"}:
+        return _chat_notice(CHAT_CANCELLED_REPLY, "cancelled", "request_correction")
+    if step == chat_state.STEP_DETAILS:
+        # Free text is never forwarded to a model while details are pending.
+        return _chat_notice(
+            CHAT_DETAILS_WAITING_REPLY, "details_step", "request_correction",
+            chat_state.issue_state(user.user_id, chat_state.STEP_DETAILS, session_key=session_key),
+        )
+    if reply == "yes":
+        # Re-check authorization and the Pending restriction; "yes" itself authorizes nothing.
+        if "submit_record_correction" not in user.permissions:
+            raise HTTPException(status_code=403, detail="You do not have permission to submit corrections.")
+        offer = await _correction_offer_or_pending(user)
+        if offer.mode != "offer":
+            return offer
+        return _chat_notice(
+            CHAT_DETAILS_REPLY, "details_step", "request_correction",
+            chat_state.issue_state(user.user_id, chat_state.STEP_DETAILS, session_key=session_key),
+        )
+    return None
+
+
+class CorrectionStepRequest(BaseModel):
+    """Structured, authenticated field for the proposal. Never routed through chat or a model."""
+
+    model_config = {"extra": "forbid"}
+    proposed_treatment: str = Field(min_length=1, max_length=2000)
+    state_token: str = Field(min_length=1, max_length=chat_state.MAX_TOKEN_CHARS)
+
+
+class CorrectionReviewResponse(BaseModel):
+    proposed_treatment: str
+    state_token: str
+    expires_in_seconds: int
+    notice: str
+
+
+def _assistant_correction_guard(user: CurrentUser, payload: CorrectionStepRequest) -> str:
+    if (
+        user.role != Role.PATIENT
+        or ASSISTANT_PERMISSION not in user.permissions
+        or "submit_record_correction" not in user.permissions
+    ):
+        raise HTTPException(status_code=403, detail="You do not have permission to submit correction requests.")
+    if not payload.proposed_treatment.strip():
+        raise HTTPException(status_code=422, detail="The proposed treatment must contain 1 to 2000 characters.")
+    if not user._session_key:
+        raise HTTPException(status_code=409, detail="Please sign in again to continue.")
+    return user._session_key
+
+
+@app.post("/api/patient/assistant/correction/review", response_model=CorrectionReviewResponse)
+async def review_assistant_correction(
+    payload: CorrectionStepRequest,
+    user: Annotated[CurrentUser, Depends(require_patient)],
+) -> CorrectionReviewResponse:
+    """Review step: needs the details-step token. Nothing is written or sent to a model."""
+    session_key = _assistant_correction_guard(user, payload)
+    try:
+        step = chat_state.consume_state(payload.state_token, user.user_id, session_key=session_key)
+    except chat_state.InvalidStateError as error:
+        raise HTTPException(status_code=409, detail=CHAT_STATE_INVALID_DETAIL) from error
+    if step != chat_state.STEP_DETAILS:
+        raise HTTPException(status_code=409, detail=CHAT_STATE_INVALID_DETAIL)
+    blocking_id = await _blocking_correction_request_id(user.user_id)
+    if blocking_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Correction request #{blocking_id} is still awaiting Physician review. "
+                "You can submit a new correction after it has been reviewed."
+            ),
+        )
+    return CorrectionReviewResponse(
+        proposed_treatment=payload.proposed_treatment,
+        state_token=chat_state.issue_state(
+            user.user_id, chat_state.STEP_CONFIRM, session_key=session_key,
+            proposal_hash=chat_state.bind_text(payload.proposed_treatment),
+        ),
+        expires_in_seconds=chat_state.STATE_TTL_SECONDS,
+        notice=(
+            "This does not change your record. Your assigned Physician will review it. "
+            "Press Confirm to submit this request."
+        ),
+    )
+
+
+@app.post(
+    "/api/patient/assistant/correction/confirm",
+    response_model=PatientCorrectionRequestResponse,
+)
+async def confirm_assistant_correction(
+    payload: CorrectionStepRequest,
+    user: Annotated[CurrentUser, Depends(require_patient)],
+) -> PatientCorrectionRequestResponse:
+    """Final Confirm: a valid, single-use confirm token for this exact text, then the shared submit path.
+
+    The token is consumed before submitting and the submission is never retried.
+    """
+    session_key = _assistant_correction_guard(user, payload)
+    try:
+        step = chat_state.consume_state(
+            payload.state_token, user.user_id, session_key=session_key,
+            proposal_hash=chat_state.bind_text(payload.proposed_treatment),
+        )
+    except chat_state.InvalidStateError as error:
+        raise HTTPException(status_code=409, detail=CHAT_STATE_INVALID_DETAIL) from error
+    if step != chat_state.STEP_CONFIRM:
+        raise HTTPException(status_code=409, detail=CHAT_STATE_INVALID_DETAIL)
+    return await _submit_correction(user, payload.proposed_treatment)
+
+
+def _fallback_reason_code(response: PatientChatResponse) -> str:
+    if response.intent == "greeting":
+        return "greeting"
+    if response.intent == "none":
+        return "no_pending_step"
+    if response.decision == "Allow":
+        return "low_risk_permitted"
+    if response.decision == "Escalate":
+        return "high_risk_requires_physician"
+    return "guardrail_blocked"
+
+
+async def _write_chat_audit(user: CurrentUser, response: PatientChatResponse) -> None:
+    """One audit_logs row per chat decision. Never contains message or reply text.
+
+    A failed audit write is logged but never changes or blocks the patient's reply.
+    """
+    await _insert_chat_audit(
+        user,
+        f"patient.chat.{response.decision.lower()}",
+        {
+            "intent": response.intent,
+            "reason_code": response.reason_code,
+            "reason": response.reason,
+            "mode": response.mode,
+            "data_access": response.data_access,
+        },
+    )
+
+
+async def _insert_chat_audit(user: CurrentUser, event_type: str, details: dict[str, Any]) -> None:
+    try:
+        key = _service_role_key()
+        audit = await _request_supabase(
+            "/rest/v1/audit_logs",
+            api_key=key,
+            bearer_token=key,
+            method="POST",
+            json_body={
+                "user_id": user.user_id,
+                "event_type": event_type,
+                "details": json.dumps(details, separators=(",", ":")),
+            },
+            extra_headers={"Prefer": "return=minimal"},
+        )
+        if not audit.is_success:
+            logger.error("Patient chat audit insert returned HTTP %s.", audit.status_code)
+    except Exception as error:  # never let auditing break the reply
+        logger.error("Patient chat audit insert failed (%s).", type(error).__name__)
+
+
+async def _run_chat_turn(payload: PatientChatRequest, user: CurrentUser) -> PatientChatResponse:
+    """One assistant turn with an explainable reason and an audit event for its decision."""
+    response = await _run_chat_turn_inner(payload, user)
+    if response.decision == "Allow" and response.mode == "refusal":
+        # Safety net: a permitted request whose answer was stopped is never reported as Allow.
+        response.decision = "Block"
+        response.reason_code = "response_blocked_by_safety_check"
+        response.reason = None
+    if response.data_access is None:
+        response.data_access = "none"
+    if response.reason_code is None:
+        response.reason_code = _fallback_reason_code(response)
+    if response.reason is None:
+        response.reason = explain(response.reason_code)
+    await _write_chat_audit(user, response)
+    return response
+
+
+async def _own_record_reply(message: str, user: CurrentUser) -> PatientChatResponse:
+    """Answer from the authenticated patient's own record only. No model is involved.
+
+    Authorization still goes through the gateway. The lookup uses the verified account's
+    user_id (never the message), and a failure is reported as such rather than guessed at.
+    """
+    gateway = decide(
+        role=user.role.value,
+        permissions=user.permissions,
+        proposal=IntentProposal("view_own_record", 1.0),
+        rails_passed=True,
+    )
+    if gateway.decision != "Allow":
+        chat = await converse(message, gateway)
+        return PatientChatResponse(
+            reply=chat.reply, decision=gateway.decision, intent=gateway.intent,
+            mode=chat.mode, reason_code=gateway.reason_code,  # type: ignore[arg-type]
+        )
+    try:
+        record = (await _load_own_record(user)).record
+    except HTTPException:
+        return PatientChatResponse(
+            reply=RECORD_UNAVAILABLE_REPLY, decision="Allow", intent="view_own_record", mode="notice",
+            reason_code="record_unavailable", data_access="unavailable",
+        )
+    if record is None:
+        return PatientChatResponse(
+            reply=RECORD_MISSING_REPLY, decision="Allow", intent="view_own_record", mode="notice",
+            reason_code="record_not_found", data_access="not_found",
+        )
+    return PatientChatResponse(
+        reply=record_reply(
+            message, age=record.age, medical_condition=record.medical_condition, treatment=record.treatment
+        ),
+        decision="Allow", intent="view_own_record", mode="record",
+        reason_code="record_retrieved", data_access="retrieved",
+    )
+
+
+async def _run_chat_turn_inner(payload: PatientChatRequest, user: CurrentUser) -> PatientChatResponse:
+    """The assistant turn (follow-up, greeting, safety screen, rails, gateway, reply)."""
+    if payload.state_token is not None:
+        follow_up = await _chat_follow_up(payload, user)
+        if follow_up is not None:
+            return follow_up
+    elif chat_state.interpret_reply(payload.message) is not None:
+        return PatientChatResponse(
+            reply=CHAT_NOTHING_PENDING_REPLY, decision="Allow", intent="none", mode="notice"
+        )
+    greeting = canned_reply(payload.message)
+    if greeting is not None:  # fixed, non-actionable reply; no model call
+        return PatientChatResponse(reply=greeting.reply, decision="Allow", intent="greeting", mode="greeting")
+    verdict = safety_rules.screen(payload.message)
+    if verdict is not None:  # deterministic: emergencies and forbidden requests never reach a model
+        return PatientChatResponse(
+            reply=verdict.reply,
+            decision=verdict.decision,
+            intent=verdict.intent,
+            mode=verdict.mode,
+            reason_code=verdict.reason_code,
+        )
+    if safety_rules.is_own_record_query(payload.message):  # a lookup of the patient's own details
+        return await _own_record_reply(payload.message, user)
+    try:
+        # One budget for the whole turn (intent, answer and any retry), shorter than the browser's
+        # wait, so the patient gets a clear "unavailable" instead of the browser giving up first.
+        async with asyncio.timeout(CHAT_TURN_BUDGET_SECONDS):
+            recognition = await recognize_intent(payload.message)
+            gateway = decide(
+                role=user.role.value,
+                permissions=user.permissions,
+                proposal=parse_proposal(recognition.text),
+                rails_passed=recognition.rails_passed,
+            )
+            if gateway.decision == "Escalate" and gateway.intent == "request_correction":
+                return await _correction_offer_or_pending(user)
+            if (
+                gateway.decision == "Allow"
+                and gateway.intent == "view_own_record"
+                and not safety_rules.is_navigation_or_third_party(payload.message)
+            ):
+                return await _own_record_reply(payload.message, user)
+            chat = await converse(payload.message, gateway)
+    except (RecognizerUnavailableError, ChatUnavailableError, TimeoutError) as error:
+        logger.warning("Chat turn unavailable (%s).", type(error).__name__)
+        await _insert_chat_audit(
+            user, "patient.chat.unavailable", {"reason_code": "assistant_unavailable", "cause": type(error).__name__}
+        )
+        raise HTTPException(status_code=503, detail="The assistant is unavailable right now.") from error
+    decision, reason_code = gateway.decision, gateway.reason_code
+    if chat.mode == "refusal" and decision == "Allow":
+        # Permitted, but the generated answer was stopped. Say which component stopped it.
+        decision, reason_code = "Block", _blocked_reason_code(chat.blocked_by, chat.blocked_detail)
+    return PatientChatResponse(
+        reply=chat.reply,
+        decision=decision,
+        intent=gateway.intent,
+        mode=chat.mode,
+        reason_code=reason_code,
+    )
+
+
+def _blocked_reason_code(blocked_by: str | None, detail: str | None) -> str:
+    """Safe reason code for a stopped answer: names the component (and category), never any text."""
+    if blocked_by == "input_rail":
+        return "response_blocked_by_input_rail"
+    if blocked_by == "output_rail":
+        return "response_blocked_by_output_rail"
+    if blocked_by == "output_check":
+        return f"response_blocked_by_output_check_{detail}" if detail else "response_blocked_by_output_check"
+    return "response_blocked_by_safety_check"
+
+
+# ---- Persistent chat history (migration 008). Everything below is inert unless
+# HASF_CHAT_HISTORY_ENABLED=true; deletion alone is always available to the owner. ----
+
+CHAT_HISTORY_UNAVAILABLE_DETAIL = "Chat history is temporarily unavailable."
+CHAT_REPLAY_INTENT = "replay"
+
+
+async def _chat_history_rpc(function: str, body: dict[str, Any]) -> Any:
+    """POST one of the six migration-008 functions with the service role. Returns parsed JSON."""
+    try:
+        service_key = _service_role_key()
+        response = await _request_supabase(
+            f"/rest/v1/rpc/{function}",
+            api_key=service_key,
+            method="POST",
+            json_body=body,
+            extra_headers={"Authorization": f"Bearer {service_key}"},
+        )
+    except (HTTPException, httpx.HTTPError) as error:
+        transport_error = error.__cause__ if isinstance(error, HTTPException) else error
+        unconfirmed = isinstance(transport_error, httpx.RequestError) and not isinstance(
+            transport_error, CORRECTION_NOT_SENT_ERRORS
+        )
+        logger.error("Chat history RPC %s failed (%s).", function, type(transport_error or error).__name__)
+        raise chat_history.ChatHistoryRpcError(unconfirmed=unconfirmed) from error
+    if not response.is_success:
+        error_code = ""
+        try:
+            rpc_error = response.json()
+            if isinstance(rpc_error, dict) and isinstance(rpc_error.get("code"), str):
+                error_code = rpc_error["code"]
+        except ValueError:
+            pass
+        logger.error(
+            "Chat history RPC %s returned HTTP %s (database code %s).",
+            function, response.status_code, error_code or "unavailable",
+        )
+        raise chat_history.ChatHistoryRpcError(
+            error_code,
+            unconfirmed=chat_history.http_failure_unconfirmed(response.status_code, error_code),
+            status=response.status_code,
+        )
+    try:
+        return response.json()
+    except ValueError as error:
+        raise chat_history.ChatHistoryRpcError(unconfirmed=True) from error
+
+
+def _with_save(
+    response: PatientChatResponse,
+    payload: PatientChatRequest,
+    status: str,
+    reason: str | None = None,
+) -> PatientChatResponse:
+    response.chat_id = payload.chat_id
+    response.turn_id = payload.turn_id
+    response.save_status = status  # type: ignore[assignment]
+    response.save_reason = reason  # type: ignore[assignment]
+    return response
+
+
+def _replayed_response(
+    stored: dict[str, Any], payload: PatientChatRequest
+) -> PatientChatResponse | None:
+    """Rebuild a stored turn. Correction events never come back as a resumable step."""
+    reply, mode = stored.get("reply"), stored.get("mode")
+    if not isinstance(reply, str) or not isinstance(mode, str):
+        return None
+    if mode == chat_history.EVENT_MODE:
+        reply, mode = chat_history.REPLAY_EVENT_NOTICE, "notice"
+    elif mode not in chat_history.SAVEABLE_MODES:
+        return None
+    return _with_save(
+        PatientChatResponse(
+            reply=reply, decision="Allow", intent=CHAT_REPLAY_INTENT, mode=mode  # type: ignore[arg-type]
+        ),
+        payload,
+        "duplicate",
+    )
+
+
+async def _find_stored_turn(user: CurrentUser, payload: PatientChatRequest) -> dict[str, Any] | None:
+    """Replay check, before any model call or token use. Raises 422 on turn-id misuse."""
+    for text in chat_history.find_candidates(payload.message, payload.state_token):
+        try:
+            found = await _chat_history_rpc(
+                "find_patient_chat_turn",
+                {
+                    "p_user_id": user.user_id,
+                    "p_chat_id": str(payload.chat_id),
+                    "p_turn_id": str(payload.turn_id),
+                    "p_user_text": text,
+                },
+            )
+        except chat_history.ChatHistoryRpcError as error:
+            if error.db_code == "PT422":
+                continue  # try the other candidate text; 422 only if none matches
+            raise
+        if isinstance(found, dict) and found.get("found") is True:
+            return found
+        if isinstance(found, dict) and found.get("found") is False:
+            return None
+        raise chat_history.ChatHistoryRpcError(unconfirmed=False)  # unreadable answer
+    raise HTTPException(status_code=422, detail="This turn id was already used for a different message.")
+
+
+async def _save_turn(
+    user: CurrentUser, payload: PatientChatRequest, response: PatientChatResponse
+) -> PatientChatResponse:
+    plan, skip_reason = chat_history.evaluate_persistence(
+        message=payload.message,
+        reply=response.reply,
+        mode=response.mode,
+        intent=response.intent,
+        state_token=payload.state_token,
+    )
+    if plan is None:
+        return _with_save(response, payload, "not_saved", skip_reason)
+    try:
+        result = await _chat_history_rpc(
+            "save_patient_chat_turn",
+            {
+                "p_user_id": user.user_id,
+                "p_chat_id": str(payload.chat_id),
+                "p_is_new": payload.is_new_chat,
+                "p_turn_id": str(payload.turn_id),
+                "p_user_text": plan.user_text,
+                "p_reply_text": plan.reply_text,
+                "p_reply_mode": plan.reply_mode,
+            },
+        )
+    except chat_history.ChatHistoryRpcError as error:
+        if error.unconfirmed:
+            return _with_save(response, payload, "unconfirmed")
+        reason = {"PT404": "chat_unavailable", "PT409": "chat_full", "PT429": "chat_limit"}.get(
+            error.db_code, "error"
+        )
+        return _with_save(response, payload, "not_saved", reason)
+    if not isinstance(result, dict) or not isinstance(result.get("duplicate"), bool):
+        # A 2xx with an unreadable body: the write may have committed.
+        return _with_save(response, payload, "unconfirmed")
+    if result["duplicate"]:
+        # Another request saved this turn first; answer consistently with what is stored.
+        replay = _replayed_response(result, payload)
+        return replay if replay is not None else _with_save(response, payload, "duplicate")
+    # A correction step is kept only as a fixed placeholder; say so instead of "conversation saved".
+    redacted = "redacted" if plan.reply_mode == chat_history.EVENT_MODE else None
+    return _with_save(response, payload, "saved", redacted)
+
+
+_SAVE_FIELDS = {"chat_id", "turn_id", "save_status", "save_reason"}
+
+
+def _chat_json(response: PatientChatResponse, include_save: bool) -> JSONResponse:
+    """Serialize a chat reply. Without chat-history ids the body keeps its original shape,
+    so existing clients with strict response validation see no new fields."""
+    return JSONResponse(response.model_dump(mode="json", exclude=None if include_save else _SAVE_FIELDS))
+
+
+@app.post("/api/patient/assistant/chat", response_model=PatientChatResponse)
+async def chat_with_patient_assistant(
+    payload: PatientChatRequest,
+    user: Annotated[CurrentUser, Depends(require_patient)],
+) -> Response:
+    """Conversational reply. The Action Gateway decides; nothing is executed.
+
+    With HASF_CHAT_HISTORY_ENABLED=true and chat_id/turn_id supplied, safe turns are also saved.
+    """
+    if ASSISTANT_PERMISSION not in user.permissions:
+        raise HTTPException(status_code=403, detail="You do not have permission to use the assistant.")
+    opted_in = payload.chat_id is not None or payload.turn_id is not None
+    if not chat_history.enabled():
+        return _chat_json(
+            _with_save(await _run_chat_turn(payload, user), payload, "disabled"), include_save=opted_in
+        )
+    if payload.chat_id is None or payload.turn_id is None:
+        return _chat_json(
+            _with_save(await _run_chat_turn(payload, user), payload, "not_saved", "no_ids"),
+            include_save=True,
+        )
+    return _chat_json(await _persisted_chat_turn(payload, user), include_save=True)
+
+
+async def _persisted_chat_turn(payload: PatientChatRequest, user: CurrentUser) -> PatientChatResponse:
+    assert payload.turn_id is not None
+    async with chat_history.inflight(user.user_id, payload.turn_id):
+        try:
+            stored = await _find_stored_turn(user, payload)
+        except chat_history.ChatHistoryRpcError:
+            # Cannot check for a replay, so do not risk a double save: answer without saving.
+            return _with_save(await _run_chat_turn(payload, user), payload, "not_saved", "error")
+        if stored is not None:
+            replay = _replayed_response(stored, payload)
+            if replay is not None:
+                return replay
+            return _with_save(await _run_chat_turn(payload, user), payload, "not_saved", "error")
+        return await _save_turn(user, payload, await _run_chat_turn(payload, user))
+
+
+class PatientChatSummary(BaseModel):
+    model_config = {"extra": "forbid"}
+    chat_id: UUID
+    title: str
+    last_activity_at: str
+    message_count: int
+
+
+class PatientChatListResponse(BaseModel):
+    chats: list[PatientChatSummary]
+
+
+class PatientChatMessage(BaseModel):
+    """Stored text only. There is deliberately no state_token: correction steps never resume."""
+
+    model_config = {"extra": "forbid"}
+    role: Literal["user", "assistant"]
+    content: str
+    display_mode: str | None = None
+    created_at: str
+
+
+class PatientChatMessagesResponse(BaseModel):
+    chat_id: UUID
+    messages: list[PatientChatMessage]
+
+
+def _history_error(error: "chat_history.ChatHistoryRpcError") -> HTTPException:
+    if error.db_code == "PT404":
+        return HTTPException(status_code=404, detail="Conversation not found.")
+    if error.unconfirmed:
+        return HTTPException(status_code=504, detail=CHAT_HISTORY_UNAVAILABLE_DETAIL)
+    return HTTPException(status_code=503, detail=CHAT_HISTORY_UNAVAILABLE_DETAIL)
+
+
+def _require_history_enabled() -> None:
+    if not chat_history.enabled():
+        raise HTTPException(status_code=404, detail="Not found.")
+
+
+def _rows(value: Any) -> list[Any]:
+    if not isinstance(value, list):
+        raise ValueError("unexpected chat history response")
+    return value
+
+
+@app.get("/api/patient/assistant/chats", response_model=PatientChatListResponse)
+async def list_patient_chat_history(
+    user: Annotated[CurrentUser, Depends(require_patient)],
+) -> PatientChatListResponse:
+    _require_history_enabled()
+    try:
+        rows = await _chat_history_rpc("list_patient_chats", {"p_user_id": user.user_id})
+        return PatientChatListResponse(chats=_rows(rows))  # type: ignore[arg-type]
+    except chat_history.ChatHistoryRpcError as error:
+        raise _history_error(error) from error
+    except ValueError as error:  # includes pydantic ValidationError
+        raise HTTPException(status_code=503, detail=CHAT_HISTORY_UNAVAILABLE_DETAIL) from error
+
+
+@app.get("/api/patient/assistant/chats/{chat_id}", response_model=PatientChatMessagesResponse)
+async def get_patient_chat_history(
+    chat_id: UUID,
+    user: Annotated[CurrentUser, Depends(require_patient)],
+) -> PatientChatMessagesResponse:
+    _require_history_enabled()
+    try:
+        rows = await _chat_history_rpc(
+            "get_patient_chat_messages", {"p_user_id": user.user_id, "p_chat_id": str(chat_id)}
+        )
+        # Stored correction-step placeholders become one privacy notice; the stored rows are untouched.
+        shown = chat_history.present_messages(_rows(rows))
+        return PatientChatMessagesResponse(chat_id=chat_id, messages=shown)  # type: ignore[arg-type]
+    except chat_history.ChatHistoryRpcError as error:
+        raise _history_error(error) from error
+    except ValueError as error:
+        raise HTTPException(status_code=503, detail=CHAT_HISTORY_UNAVAILABLE_DETAIL) from error
+
+
+@app.delete("/api/patient/assistant/chats/{chat_id}", status_code=204)
+async def delete_patient_chat_history(
+    chat_id: UUID,
+    user: Annotated[CurrentUser, Depends(require_patient)],
+) -> Response:
+    """Owner-only delete; available even when persistence is disabled."""
+    try:
+        deleted = await _chat_history_rpc(
+            "delete_patient_chat", {"p_user_id": user.user_id, "p_chat_id": str(chat_id)}
+        )
+    except chat_history.ChatHistoryRpcError as error:
+        raise _history_error(error) from error
+    if deleted is not True:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return Response(status_code=204)
 
 
 @app.get("/api/authorization/{action}", response_model=AuthorizationResponse)

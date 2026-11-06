@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { Link, useOutletContext } from "react-router-dom";
+import { Link, useLocation, useOutletContext } from "react-router-dom";
 
 import { PageHeader } from "../../shared/WorkspaceShell.jsx";
 import {
@@ -9,10 +9,13 @@ import {
   ErrorMessage,
   LoadingMessage,
   Panel,
+  RefreshButton,
 } from "../../shared/workspaceUi.jsx";
 import { submitTreatmentCorrection } from "./patientApi.js";
 import {
   MAX_PROPOSED_TREATMENT_LENGTH,
+  describeApprovalStatus,
+  describeDecision,
   describeSubmissionError,
   findBlockingRequest,
   formatDateTime,
@@ -230,7 +233,13 @@ function CorrectionForm({ session, currentTreatment, historyState, onSubmitted, 
 
 export default function PatientRecordsPage() {
   const { user, session, recordState, historyState, retryRecord, refreshHistory } = useOutletContext();
+  const location = useLocation();
   const canSubmit = user.permissions.includes("submit_record_correction");
+  const canUseAssistant = user.permissions.includes("request_ai_assistance");
+  const useClassicFallback =
+    canSubmit &&
+    (!canUseAssistant ||
+      new URLSearchParams(location.search).get("correctionFallback") === "1");
 
   return (
     <>
@@ -284,13 +293,47 @@ export default function PatientRecordsPage() {
           tone={2}
         >
           {recordState.status === "ready" && canSubmit && (
-            <CorrectionForm
-              currentTreatment={recordState.record.treatment}
-              historyState={historyState}
-              onRetryHistory={refreshHistory}
-              onSubmitted={refreshHistory}
-              session={session}
-            />
+            <div className="ws-stack">
+              {canUseAssistant && !useClassicFallback && (
+                <>
+                  <p>
+                    <Link className="ws-btn ws-btn-primary" to="/dashboard/patient/assistant">
+                      Request a Correction
+                    </Link>
+                  </p>
+                  <p className="ws-form-note">
+                    Tell the AI Assistant what needs correcting. It guides you through a secure review and
+                    confirmation step.
+                  </p>
+                </>
+              )}
+              {useClassicFallback && (
+                <>
+                  <p className="ws-form-note">
+                    {canUseAssistant
+                      ? "The AI-assisted correction process is temporarily unavailable. You can use this secure form instead."
+                      : "The AI-assisted correction process is unavailable for your account. You can use this secure form instead."}
+                    {" "}Your assigned Physician will still review the request before any record changes.
+                  </p>
+                  {canUseAssistant && (
+                    <p>
+                      <Link className="ws-link-button" to="/dashboard/patient/assistant">
+                        Return to the AI Assistant
+                      </Link>
+                    </p>
+                  )}
+                </>
+              )}
+              {useClassicFallback && (
+                <CorrectionForm
+                  currentTreatment={recordState.record.treatment}
+                  historyState={historyState}
+                  onRetryHistory={refreshHistory}
+                  onSubmitted={refreshHistory}
+                  session={session}
+                />
+              )}
+            </div>
           )}
           {recordState.status === "ready" && !canSubmit && (
             <EmptyMessage>
@@ -302,6 +345,107 @@ export default function PatientRecordsPage() {
           )}
         </Panel>
       </div>
+
+      <Panel
+        aside={
+          historyState.status !== "forbidden" && (
+            <RefreshButton
+              busy={historyState.status === "loading"}
+              label="Refresh requests"
+              onClick={refreshHistory}
+            />
+          )
+        }
+        eyebrow="YOUR ACTIVITY"
+        icon="history"
+        subtitle="Track each treatment correction request and its Physician review."
+        title="My Correction Requests"
+        titleId="correction-requests-title"
+        tone={3}
+      >
+        {historyState.status === "forbidden" && (
+          <EmptyMessage>Correction request history is not available for your account.</EmptyMessage>
+        )}
+        {historyState.status === "loading" && (
+          <LoadingMessage>Loading your correction requests securely…</LoadingMessage>
+        )}
+        {historyState.status === "error" && (
+          <ErrorMessage
+            message={historyState.error || "Could not load your correction requests."}
+            onRetry={refreshHistory}
+            retryLabel="Reload requests"
+          />
+        )}
+        {historyState.status === "ready" && historyState.items.length === 0 && (
+          <EmptyMessage>
+            You haven&apos;t submitted any correction requests yet. Requests you submit will appear here.
+          </EmptyMessage>
+        )}
+        {historyState.status === "ready" && historyState.items.length > 0 && (
+          <div className="ws-table-wrap">
+            <table className="ws-table">
+              <caption className="ws-visually-hidden">
+                Your treatment correction requests, newest first
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Request ID</th>
+                  <th scope="col">Submitted</th>
+                  <th scope="col">Current status</th>
+                  <th scope="col">Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {historyState.items.map((item) => {
+                  const approval = describeApprovalStatus(item);
+                  const decision = describeDecision(item.guardrail_decision);
+                  return (
+                    <tr key={item.request_id}>
+                      <th scope="row">#{item.request_id}</th>
+                      <td>
+                        {item.created_at && formatDateTime(item.created_at) ? (
+                          <time dateTime={item.created_at}>{formatDateTime(item.created_at)}</time>
+                        ) : "—"}
+                      </td>
+                      <td><Badge tone={approval.tone}>{approval.label}</Badge></td>
+                      <td>
+                        <details>
+                          <summary className="ws-link-button">View details</summary>
+                          <dl className="ws-details">
+                            <div>
+                              <dt>Request type</dt>
+                              <dd>Treatment correction</dd>
+                            </div>
+                            <div>
+                              <dt>Guardrail decision</dt>
+                              <dd><Badge tone={decision.tone}>{decision.label}</Badge></dd>
+                            </div>
+                            <div>
+                              <dt>Physician review</dt>
+                              <dd>
+                                <Badge tone={approval.tone}>{approval.label}</Badge>
+                                {" "}{approval.description}
+                              </dd>
+                            </div>
+                            <div>
+                              <dt>Reviewed</dt>
+                              <dd>
+                                {item.reviewed_at
+                                  ? formatDateTime(item.reviewed_at) ?? "Date unavailable"
+                                  : "Not yet reviewed"}
+                              </dd>
+                            </div>
+                          </dl>
+                        </details>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
     </>
   );
 }

@@ -302,6 +302,14 @@ class CorrectionHistoryStatusMappingTests(PatientCorrectionHistoryTestCase):
         )
         self.assertEqual(items[5]["guardrail_decision"], "Escalate")
 
+    async def test_allow_decision_does_not_imply_physician_approval(self):
+        items = await self._items(
+            [_request_row(5, decision="Allow")],
+            [{"request_id": 5, "status": "Pending", "reviewed_at": None}],
+        )
+        self.assertEqual(items[5]["guardrail_decision"], "Allow")
+        self.assertEqual(items[5]["approval_status"], "Pending")
+
 
 class CorrectionSubmissionDuplicateTests(PatientCorrectionHistoryTestCase):
     async def asyncSetUp(self):

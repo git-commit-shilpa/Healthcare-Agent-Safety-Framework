@@ -166,3 +166,45 @@ approved phase. Keep identity, role, ownership, assignment, approval, and
 database authorization checks deterministic and server-enforced; do not allow
 the frontend or an AI model to authorize record access or modify clinical
 records directly.
+
+## Persistent chat history (backend, off by default)
+
+Requires migration `008_patient_chat_history.sql`. Enable with `HASF_CHAT_HISTORY_ENABLED=true` in `backend/.env`.
+
+- `POST /api/patient/assistant/chat` accepts optional `chat_id`, `turn_id` and `is_new_chat`; with them it returns `save_status` (`saved | duplicate | not_saved | unconfirmed | disabled`) and `save_reason`. Without them the response shape is unchanged.
+- `GET /api/patient/assistant/chats`, `GET /api/patient/assistant/chats/{chat_id}`, `DELETE /api/patient/assistant/chats/{chat_id}` (delete works even when the flag is off).
+- Only low-risk turns are stored. Correction-flow turns are stored as fixed event text; correction details and state tokens are never stored or restored.
+- Limitation: identical-turn coordination is per process. With multiple workers the database still saves a turn once, but the model may run twice.
+- Tests: `python -m unittest tests.test_chat_history -v`
+
+## Assistant safety pipeline and audit events
+
+Each chat message passes through, in order: the chat-state follow-up check, fixed greetings, the deterministic screen in `backend/app/safety_rules.py`, NeMo intent recognition, the RBAC Action Gateway (`backend/app/action_gateway.py`), and a guarded reply.
+
+| Message | Decision | Result |
+| --- | --- | --- |
+| General health or medical-term question (`general_health_info`) | Allow | Educational answer from the local model, with a disclaimer added in code |
+| Symptoms (`symptom_guidance`) | Allow | Cautious general guidance, a seek-urgent-care notice and the disclaimer |
+| Emergency wording (chest pain, can't breathe, suicidal thoughts, stroke signs) | Escalate | Fixed emergency message; no model is called and the turn is never saved to history |
+| Prescription, medication dose, diagnosis, direct record change | Block | Fixed referral to a Physician (record changes point to the correction flow) |
+| Another person's information | Block | Fixed refusal |
+| Correction request | Escalate | Existing confirm-gated physician-review flow |
+| Unclear or off-topic | Block (`guardrail_blocked`) | Scope-limited message asking the patient to rephrase |
+
+Replies carry `reason_code` and a plain-language `reason`. Model output that diagnoses the user or claims to be a clinician is replaced by a fixed message (one retry first).
+
+Every decision writes one `audit_logs` row: `event_type` is `patient.chat.allow`, `patient.chat.block` or `patient.chat.escalate`, and `details` holds only `intent`, `reason_code`, `reason` and `mode`. Message and reply text are never audited. A failed audit write is logged and does not change the reply.
+
+Tests: `python -m unittest tests.test_safety_rules -v`
+
+## Asking about your own record in chat
+
+A plain request to read back your own details ("What is my current medical condition?", "What is my treatment?", "How old am I?") is answered from your own record, with no language model involved:
+
+- The server reads the row for the signed-in account (`user_id` from the verified account, never from the message or a model), using the same loader as `GET /api/patient/my-record`.
+- Only the fields asked about are shown. A missing record, a null field and a failed lookup are each stated as such (`data_access`: `retrieved`, `not_found`, `unavailable`).
+- These replies are never saved to chat history (`save_reason: sensitive`). Audit rows record only the outcome, never the values.
+- Diagnosis ("Do I have…?"), prescriptions, doses, record changes and other people's data stay blocked, and corrections still go through Physician review.
+- If an allowed request's generated answer is stopped by the safety checks, the response is reported as `Block` (`response_blocked_by_safety_check`), not Allow.
+
+Latency: the backend loads the Ollama model at startup and keeps it warm. A chat turn has an 85 s budget (the browser waits 100 s); exceeding it returns 503 and writes a `patient.chat.unavailable` audit row.

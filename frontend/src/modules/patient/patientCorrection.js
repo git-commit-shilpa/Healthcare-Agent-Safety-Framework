@@ -15,7 +15,7 @@ export const PERMISSION_DESCRIPTIONS = {
   view_own_record: "View your own medical record",
   submit_record_correction: "Request corrections to your medical record",
   view_own_correction_requests: "Track your correction requests",
-  request_ai_assistance: "Ask the AI assistant (available in a later phase)",
+  request_ai_assistance: "Use the AI-assisted correction flow",
 };
 
 export function validateProposedTreatment(proposedTreatment, currentTreatment) {

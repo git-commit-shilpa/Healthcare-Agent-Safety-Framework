@@ -17,11 +17,16 @@ import {
 } from "../modules/admin/AdminPages.jsx";
 import AdminWorkspace from "../modules/admin/AdminWorkspace.jsx";
 import PatientRecordsPage from "../modules/patient/MedicalRecordsSection.jsx";
+import PatientAppointmentsPage from "../modules/patient/AppointmentsPage.jsx";
 import PatientAssistantPage from "../modules/patient/PatientAssistantPage.jsx";
 import PatientOverviewPage from "../modules/patient/PatientOverview.jsx";
 import PatientWorkspace from "../modules/patient/PatientWorkspace.jsx";
 import PatientProfilePage from "../modules/patient/ProfileSection.jsx";
-import PatientHistoryPage from "../modules/patient/RequestHistorySection.jsx";
+import PatientRequestsPage from "../modules/patient/RequestsPage.jsx";
+import TechnicianOverviewPage from "../modules/technician/TechnicianOverview.jsx";
+import TechnicianPatientsPage from "../modules/technician/TechnicianPatients.jsx";
+import TechnicianTasksPage from "../modules/technician/TechnicianTasks.jsx";
+import TechnicianWorkspace from "../modules/technician/TechnicianWorkspace.jsx";
 import { getApiJson, roles } from "../shared/apiClient.js";
 import { AuthProvider, useAuth } from "./auth.jsx";
 import { AuthIssuePage, LoadingPage, LoginPage, SetPasswordPage } from "./AuthPages.jsx";
@@ -76,6 +81,19 @@ function PatientLayoutRoute() {
   const { handleLogout, signOutError } = useSignOut();
   return (
     <PatientWorkspace
+      onLogout={handleLogout}
+      session={session}
+      signOutError={signOutError}
+      user={user}
+    />
+  );
+}
+
+function TechnicianLayoutRoute() {
+  const { session, user } = useAuth();
+  const { handleLogout, signOutError } = useSignOut();
+  return (
+    <TechnicianWorkspace
       onLogout={handleLogout}
       session={session}
       signOutError={signOutError}
@@ -202,9 +220,25 @@ export function AppRoutes() {
         <Route element={<PatientOverviewPage />} path="overview" />
         <Route element={<PatientRecordsPage />} path="records" />
         <Route element={<PatientAssistantPage />} path="assistant" />
-        <Route element={<PatientHistoryPage />} path="history" />
+        <Route element={<PatientAppointmentsPage />} path="appointments" />
+        <Route element={<PatientRequestsPage />} path="requests" />
+        {/* Old addresses keep working (bookmarks, saved links). */}
+        <Route element={<Navigate replace to="/dashboard/patient/requests" />} path="service-requests" />
+        <Route element={<Navigate replace to="/dashboard/patient/requests" />} path="history" />
         <Route element={<PatientProfilePage />} path="profile" />
         <Route element={<Navigate replace to="/dashboard/patient/overview" />} path="*" />
+      </Route>
+
+      <Route
+        element={<RequireRole role="technician"><TechnicianLayoutRoute /></RequireRole>}
+        path="/dashboard/technician"
+      >
+        <Route element={<Navigate replace to="overview" />} index />
+        <Route element={<TechnicianOverviewPage />} path="overview" />
+        <Route element={<TechnicianPatientsPage />} path="patients" />
+        <Route element={<TechnicianTasksPage />} path="tasks" />
+        <Route element={<TechnicianTasksPage scope="scheduling" />} path="scheduling" />
+        <Route element={<Navigate replace to="/dashboard/technician/overview" />} path="*" />
       </Route>
 
       <Route element={<RequireRole><RoleDashboard /></RequireRole>} path="/dashboard/:role" />

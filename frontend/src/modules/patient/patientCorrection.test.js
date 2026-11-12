@@ -178,3 +178,40 @@ test("patientRequest classifies backend and transport failures", async () => {
     (error) => error.kind === "invalid",
   );
 });
+
+test("coordination on a correction is optional but must be well-formed when present", async () => {
+  const { parseHistoryResponse, validateCorrectionReply, MAX_CORRECTION_REPLY } = await import("./patientCorrection.js");
+  const base = { request_id: 5, created_at: null, reviewed_at: null, guardrail_decision: "Escalate", approval_status: "Pending", status_issue: null };
+  assert.equal(parseHistoryResponse({ items: [base] }).length, 1);
+  assert.equal(parseHistoryResponse({ items: [{ ...base, coordination: null }] }).length, 1);
+  const good = { task_id: 3, status: "On Hold", status_label: "x", patient_message: null, can_add_info: true };
+  assert.equal(parseHistoryResponse({ items: [{ ...base, coordination: good }] })[0].coordination.task_id, 3);
+  assert.throws(() => parseHistoryResponse({ items: [{ ...base, coordination: { task_id: "3" } }] }));
+  assert.equal(validateCorrectionReply("   ") !== null, true);
+  assert.equal(validateCorrectionReply("x".repeat(MAX_CORRECTION_REPLY + 1)) !== null, true);
+  assert.equal(validateCorrectionReply("It changed in March."), null);
+});
+
+test("Technician-first (015): a new correction has no approval yet and says where it is", async () => {
+  const { parseSubmissionResponse, parseHistoryResponse, describeApprovalStatus, findBlockingRequest } = await import("./patientCorrection.js");
+  assert.ok(parseSubmissionResponse({ request_id: 7, guardrail_decision: "Escalate", approval_status: null, coordination: "assigned" }));
+  assert.ok(parseSubmissionResponse({ request_id: 7, guardrail_decision: "Escalate", approval_status: "Pending" }));         // pre-015 server
+  assert.equal(parseSubmissionResponse({ request_id: 7, guardrail_decision: "Escalate", approval_status: null, coordination: "unassigned" }), null);
+  assert.equal(parseSubmissionResponse({ request_id: 7, guardrail_decision: "Escalate", approval_status: "Approved" }), null);
+
+  const base = { request_id: 5, created_at: null, reviewed_at: null, guardrail_decision: "Escalate", status_issue: null };
+  const careTeam = { ...base, approval_status: null, review_stage: "with_care_team" };
+  assert.equal(parseHistoryResponse({ items: [careTeam] }).length, 1);
+  assert.throws(() => parseHistoryResponse({ items: [{ ...careTeam, review_stage: "mystery" }] }));
+  assert.equal(describeApprovalStatus(careTeam).label, "With your care team");
+  assert.equal(describeApprovalStatus({ ...careTeam, review_stage: "needs_reply" }).label, "Needs your reply");
+  assert.equal(describeApprovalStatus({ ...careTeam, review_stage: "declined" }).label, "Closed by your care team");
+  assert.equal(describeApprovalStatus({ ...base, approval_status: "Pending", review_stage: "with_physician" }).label, "Pending review");
+  assert.equal(describeApprovalStatus({ ...base, approval_status: null, review_stage: null, status_issue: "missing_approval" }).label, "Needs attention");
+
+  // Waiting for the care team blocks a second request; a declined one does not.
+  assert.equal(findBlockingRequest([careTeam]).request_id, 5);
+  assert.equal(findBlockingRequest([{ ...careTeam, review_stage: "declined" }]), null);
+  assert.equal(findBlockingRequest([{ ...base, approval_status: "Approved", review_stage: "approved" }]), null);
+  assert.equal(findBlockingRequest([{ ...base, approval_status: null, review_stage: null, status_issue: "missing_approval" }]).request_id, 5);
+});

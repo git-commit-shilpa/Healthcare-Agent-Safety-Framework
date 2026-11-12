@@ -3,6 +3,7 @@ export const MAX_PROPOSED_TREATMENT_LENGTH = 2000;
 const GUARDRAIL_DECISIONS = new Set(["Allow", "Block", "Escalate"]);
 const APPROVAL_STATUSES = new Set(["Pending", "Approved", "Rejected"]);
 const FINAL_APPROVAL_STATUSES = new Set(["Approved", "Rejected"]);
+const REVIEW_STAGES = new Set(["with_care_team", "needs_reply", "with_physician", "approved", "rejected", "declined"]);
 const STATUS_ISSUES = new Set([
   "missing_approval",
   "multiple_approvals",
@@ -53,6 +54,27 @@ export function parseRecordResponse(result) {
   return record;
 }
 
+export const MAX_CORRECTION_REPLY = 500;
+
+/** The care-team coordination status the backend adds to a correction (migration 014); absent or null is fine. */
+function isValidCoordination(value) {
+  if (value === undefined || value === null) return true;
+  return (
+    typeof value === "object" &&
+    Number.isInteger(value.task_id) &&
+    typeof value.status_label === "string" &&
+    typeof value.can_add_info === "boolean" &&
+    isNullableString(value.patient_message)
+  );
+}
+
+export function validateCorrectionReply(text) {
+  const trimmed = text.trim();
+  if (!trimmed) return "Write your reply first.";
+  if (trimmed.length > MAX_CORRECTION_REPLY) return `Keep your reply under ${MAX_CORRECTION_REPLY} characters.`;
+  return null;
+}
+
 export function parseHistoryResponse(result) {
   if (!result || typeof result !== "object" || !Array.isArray(result.items)) {
     throw new Error("The request history response was invalid.");
@@ -66,7 +88,9 @@ export function parseHistoryResponse(result) {
       !isNullableString(item.reviewed_at) ||
       !(item.guardrail_decision === null || GUARDRAIL_DECISIONS.has(item.guardrail_decision)) ||
       !(item.approval_status === null || APPROVAL_STATUSES.has(item.approval_status)) ||
-      !(item.status_issue === null || STATUS_ISSUES.has(item.status_issue))
+      !(item.status_issue === null || STATUS_ISSUES.has(item.status_issue)) ||
+      !isValidCoordination(item.coordination) ||
+      !(item.review_stage === undefined || item.review_stage === null || REVIEW_STAGES.has(item.review_stage))
     ) {
       throw new Error("The request history response was invalid.");
     }
@@ -79,18 +103,26 @@ export function parseSubmissionResponse(result) {
     !result ||
     typeof result !== "object" ||
     !Number.isInteger(result.request_id) ||
-    result.guardrail_decision !== "Escalate" ||
-    result.approval_status !== "Pending"
+    result.guardrail_decision !== "Escalate"
   ) {
     return null;
   }
+  // Technician-first (015): a new correction first goes to the care team, so there is no approval yet (null).
+  // A server that predates 015 still answers "Pending". Anything else is not trusted.
+  const waitingForCareTeam = result.approval_status === null && result.coordination === "assigned";
+  if (result.approval_status !== "Pending" && !waitingForCareTeam) return null;
   return result;
 }
 
 /** Mirrors the backend rule: anything not finally Approved/Rejected blocks. */
 export function findBlockingRequest(items) {
   return (
-    items.find((item) => !FINAL_APPROVAL_STATUSES.has(item.approval_status)) ?? null
+    items.find(
+      (item) =>
+        !FINAL_APPROVAL_STATUSES.has(item.approval_status) &&
+        // A request the care team closed before any Physician approval existed no longer blocks (015).
+        !(item.approval_status === null && !item.status_issue && item.review_stage === "declined"),
+    ) ?? null
   );
 }
 
@@ -102,6 +134,31 @@ export function describeApprovalStatus(item) {
       description:
         "This request's review records are inconsistent. It will be checked by the care team; please do not resubmit.",
     };
+  }
+  if (item.approval_status === null || item.approval_status === undefined) {
+    // No Physician approval exists (yet): show where the request really is.
+    switch (item.review_stage) {
+      case "with_care_team":
+        return {
+          label: "With your care team",
+          tone: "pending",
+          description: "Your care team is checking it first. It goes to your Physician only if clinical authorization is needed.",
+        };
+      case "needs_reply":
+        return {
+          label: "Needs your reply",
+          tone: "escalate",
+          description: "Your care team asked you for more information. Reply under Requests.",
+        };
+      case "declined":
+        return {
+          label: "Closed by your care team",
+          tone: "neutral",
+          description: "Your care team could not process this request. You can submit a new one.",
+        };
+      default:
+        return { label: "Unknown", tone: "issue", description: "Status unavailable." };
+    }
   }
   switch (item.approval_status) {
     case "Pending":

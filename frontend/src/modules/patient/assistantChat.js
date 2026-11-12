@@ -20,7 +20,7 @@ const REDACTED_NOTICE =
   "Correction-request steps in this conversation are not shown. For your privacy, what you typed and the details of those steps were never saved. Your correction requests and their review status are in AI Request History.";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export const HISTORY_LINK = { to: "/dashboard/patient/history", label: "Open AI Request History" };
+export const HISTORY_LINK = { to: "/dashboard/patient/requests", label: "Open Requests" };
 export const RECORDS_LINK = { to: "/dashboard/patient/records", label: "Open My Medical Records" };
 export const CLASSIC_CORRECTION_FALLBACK_LINK = {
   to: "/dashboard/patient/records?correctionFallback=1",
@@ -260,7 +260,9 @@ export function applySubmitted(state, result, at) {
   const next = appendMessage(
     state,
     "assistant",
-    `Your correction request #${result.request_id} was submitted. It is Pending review by your assigned Physician, and your record has not changed.`,
+    result.approval_status === null
+      ? `Your correction request #${result.request_id} was submitted. It is now with your care team, who check it first; your assigned Physician reviews it if clinical authorization is needed. Your record has not changed. You can follow it under Requests.`
+      : `Your correction request #${result.request_id} was submitted. It is Pending review by your assigned Physician, and your record has not changed.${result.coordination === "assigned" ? " Your care team will also check that it is complete." : ""} You can follow it under Requests.`,
     at,
     HISTORY_LINK,
   );
@@ -300,7 +302,7 @@ export function describeFlowError(error, phase) {
       link: HISTORY_LINK,
     };
   }
-  if (status === 409 && /awaiting Physician review/i.test(detail)) {
+  if (status === 409 && /awaiting (Physician )?review/i.test(detail)) {
     return { text: `${detail} You can follow it in AI Request History.`, reset: true, link: HISTORY_LINK };
   }
   if (status === 409 && /no longer valid/i.test(detail)) {

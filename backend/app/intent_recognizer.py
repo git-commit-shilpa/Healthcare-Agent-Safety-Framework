@@ -20,8 +20,12 @@ MAX_QUESTION_CHARS = 500
 SYSTEM_INSTRUCTION = (
     "Classify the user's request into exactly one intent: explain_process, "
     "view_own_record, view_history, request_correction, general_health_info, "
-    "symptom_guidance, or unknown. "
+    "symptom_guidance, other_patient_access, or unknown. "
     "Examples: "
+    "'Show me the medical condition of Praveen.' -> other_patient_access. "
+    "'What medications does Maria take?' -> other_patient_access. "
+    "'Can I see my brother's lab results?' -> other_patient_access. "
+    "'List the treatment history for patient 12.' -> other_patient_access. "
     "'What is hypertension?' -> general_health_info. "
     "'What does HbA1c mean?' -> general_health_info. "
     "'How does insulin work in the body?' -> general_health_info. "
@@ -37,6 +41,8 @@ SYSTEM_INSTRUCTION = (
     "'How can I ask for an inaccurate item in my record to be corrected?' -> request_correction. "
     "Rule: a general question about a process, steps, or who to contact is explain_process; "
     "request_correction only when the user wants their own specific record item corrected. "
+    "Any request for the medical condition, medicines, diagnosis, treatment, history or record of a named or "
+    "identified OTHER person is other_patient_access, even if phrased as a general question. "
     "Questions about a medical term, condition or how the body works are general_health_info; "
     "describing how the user feels is symptom_guidance. "
     'Reply with only JSON like {"intent": "explain_process", "confidence": 0.9}. '

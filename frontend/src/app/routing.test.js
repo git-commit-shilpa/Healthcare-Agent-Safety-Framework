@@ -14,6 +14,10 @@ before(async () => {
   server = await createServer({
     root: frontendRoot,
     configFile: false,
+    // Deterministic: never read the developer's real .env or VITE_* variables. Feature flags are OFF here;
+    // tests that need a flag ON build the navigation with buildWorkspacePages({...}).
+    envDir: false,
+    envPrefix: "HASF_TEST_NO_SUCH_PREFIX_",
     logLevel: "error",
     appType: "custom",
     server: { middlewareMode: true, hmr: false, watch: null },
@@ -80,7 +84,7 @@ const patientPages = {
   "/dashboard/patient/overview": "Welcome, Test.",
   "/dashboard/patient/records": "My Medical Records",
   "/dashboard/patient/assistant": "Ask AI Assistant",
-  "/dashboard/patient/history": "AI Request History",
+  "/dashboard/patient/requests": "Requests",
   "/dashboard/patient/profile": "My Profile",
 };
 
@@ -105,9 +109,9 @@ describe("direct URLs (page reload) render the matching page with an active side
 });
 
 describe("each page shows only its own content", () => {
-  test("patient history page does not render the record or correction form", () => {
-    const html = renderRoute("/dashboard/patient/history", patientAuth);
-    assert.match(html, /Your requests/);
+  test("patient requests page does not render the record or correction form", () => {
+    const html = renderRoute("/dashboard/patient/requests", patientAuth);
+    assert.match(html, /Record correction requests/);
     assert.doesNotMatch(html, /Record details/);
     assert.doesNotMatch(html, /Request a treatment correction/);
     assert.doesNotMatch(html, /What your account can do/);
@@ -181,10 +185,10 @@ describe("role protection", () => {
 
 describe("history entries (Back / Forward)", () => {
   test("each history position renders its own page", () => {
-    const entries = ["/dashboard/patient/overview", "/dashboard/patient/records", "/dashboard/patient/history"];
+    const entries = ["/dashboard/patient/overview", "/dashboard/patient/records", "/dashboard/patient/requests"];
     assert.equal(pageTitle(renderRoute(entries, patientAuth, 0)), "Welcome, Test.");
     assert.equal(pageTitle(renderRoute(entries, patientAuth, 1)), "My Medical Records");
-    assert.equal(pageTitle(renderRoute(entries, patientAuth, 2)), "AI Request History");
+    assert.equal(pageTitle(renderRoute(entries, patientAuth, 2)), "Requests");
   });
 });
 

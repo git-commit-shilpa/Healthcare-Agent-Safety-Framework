@@ -106,11 +106,11 @@ export default function PatientOverviewPage() {
           tone={1}
         />
         <ModuleLink
-          description="Follow each correction through Physician review."
+          description="Service requests and record corrections, with Physician review status."
           icon="history"
           meta={historyState.status === "ready" ? `${historyState.items.length} request(s)` : null}
-          title="AI Request History"
-          to="/dashboard/patient/history"
+          title="Requests"
+          to="/dashboard/patient/requests"
           tone={2}
         />
         <ModuleLink

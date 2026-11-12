@@ -5,6 +5,8 @@ import "./shared/styles.css";
 import "./shared/workspace.css";
 import "./app/auth.css";
 import "./modules/patient/assistantChat.css";
+import "./modules/patient/appointments.css";
+import "./modules/technician/technician.css";
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>

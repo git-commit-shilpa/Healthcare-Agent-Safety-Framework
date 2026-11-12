@@ -1,0 +1,129 @@
+/* Technician task review and Patient service-request pages. Uses the shared ws-* design tokens. */
+
+.tc-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 380px) minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+
+@media (max-width: 960px) {
+  .tc-layout { grid-template-columns: minmax(0, 1fr); }
+}
+
+.tc-tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.9rem; }
+
+.tc-tab {
+  border: 1px solid var(--ws-accent-border);
+  background: #fff;
+  color: var(--ws-accent-text);
+  border-radius: 999px;
+  padding: 0.35rem 0.8rem;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.tc-tab:hover { background: var(--ws-accent-soft); }
+.tc-tab.is-active { background: var(--ws-accent); border-color: var(--ws-accent); color: #fff; }
+.tc-tab:focus-visible, .tc-item:focus-visible, .tc-choice:focus-within { outline: 3px solid var(--ws-focus); outline-offset: 2px; }
+.tc-count { opacity: 0.8; margin-left: 0.2rem; font-variant-numeric: tabular-nums; }
+
+.tc-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+
+.tc-item {
+  width: 100%;
+  text-align: left;
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--ws-accent-border);
+  border-radius: 12px;
+  background: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+.tc-item:hover { border-color: var(--ws-accent); }
+.tc-item.is-selected { border-color: var(--ws-accent); box-shadow: 0 0 0 2px var(--ws-accent-soft); background: var(--ws-accent-soft); }
+.tc-item-top { display: flex; justify-content: space-between; gap: 0.6rem; align-items: flex-start; }
+.tc-item-meta { color: #5b6275; font-size: 0.85rem; }
+
+.tc-detail { display: grid; gap: 1rem; }
+.tc-detail-head { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; align-items: flex-start; }
+.tc-detail-head h3 { margin: 0.1rem 0 0; }
+.tc-badges { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+
+.tc-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.6rem; margin: 0; }
+.tc-facts div { background: var(--ws-accent-soft); border-radius: 10px; padding: 0.55rem 0.75rem; }
+.tc-facts dt { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: #5b6275; }
+.tc-facts dd { margin: 0.1rem 0 0; font-weight: 600; overflow-wrap: anywhere; }
+
+.tc-block h4 { margin: 0 0 0.35rem; font-size: 0.95rem; }
+.tc-block p { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+.tc-history { list-style: none; margin: 0; padding: 0 0 0 0.9rem; border-left: 2px solid var(--ws-accent-border); display: grid; gap: 0.9rem; }
+.tc-history li { position: relative; }
+.tc-history li::before { content: ""; position: absolute; left: -1.28rem; top: 0.35rem; width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--ws-accent); }
+.tc-history-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.5rem; }
+.tc-history-head span { color: #5b6275; font-size: 0.82rem; }
+.tc-history-line, .tc-note-internal { margin: 0.3rem 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.tc-note-internal { background: #fff7e0; border: 1px solid #f5dfa8; border-radius: 8px; padding: 0.5rem 0.65rem; }
+.tc-tag { display: inline-block; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; background: var(--ws-accent-soft); color: var(--ws-accent-text); border-radius: 6px; padding: 0.05rem 0.4rem; margin-right: 0.4rem; }
+.tc-tag-internal { display: block; width: fit-content; background: #f9e7ae; color: #7a4f00; margin: 0 0 0.25rem; }
+
+.tc-decision { border-top: 1px solid var(--ws-accent-border); padding-top: 1rem; }
+/* Decision cards: compact grid, the whole card is the click target, the radio itself stays for keyboard/AT. */
+.tc-choices { border: 0; margin: 0; padding: 0; display: grid; gap: 0.5rem; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.tc-choices-3 { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+@media (max-width: 560px) { .tc-choices, .tc-choices-3 { grid-template-columns: minmax(0, 1fr); } }
+.tc-choice { position: relative; display: block; min-height: 3.4rem; border: 1px solid var(--ws-accent-border); border-radius: 10px; padding: 0.5rem 2rem 0.5rem 0.75rem; cursor: pointer; background: #fff; transition: border-color 0.12s, background 0.12s; }
+.tc-choice:hover { border-color: var(--ws-accent); }
+.tc-choice.is-selected { border-color: var(--ws-accent); background: var(--ws-accent-soft); box-shadow: inset 0 0 0 1px var(--ws-accent); }
+.tc-choice input { position: absolute; opacity: 0; inset: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.tc-choice::after { content: ""; position: absolute; top: 0.6rem; right: 0.6rem; width: 0.95rem; height: 0.95rem; border-radius: 50%; border: 2px solid var(--ws-accent-border); background: #fff; }
+.tc-choice.is-selected::after { border-color: var(--ws-accent); background: radial-gradient(circle, var(--ws-accent) 0 38%, #fff 42%); }
+.tc-choice > span { display: grid; gap: 0.1rem; }
+.tc-choice strong { font-size: 0.92rem; }
+.tc-choice > span > span { color: #5b6275; font-size: 0.8rem; line-height: 1.3; }
+.tc-decision { gap: 0.7rem; }
+.tc-ap-section { padding: 0.55rem 0.85rem 0.75rem; }
+
+/* Patient service requests */
+.sr-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 1.25rem; align-items: start; }
+@media (max-width: 960px) { .sr-grid { grid-template-columns: minmax(0, 1fr); } }
+.sr-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.75rem; }
+.sr-card { border: 1px solid var(--ws-accent-border); border-radius: 14px; padding: 0.85rem 1rem; background: #fff; display: grid; gap: 0.5rem; }
+.sr-card-top { display: flex; justify-content: space-between; gap: 0.6rem; flex-wrap: wrap; align-items: flex-start; }
+.sr-card h3 { margin: 0; font-size: 1rem; }
+.sr-meta { color: #5b6275; font-size: 0.85rem; margin: 0; }
+.sr-message { background: var(--ws-accent-soft); border-radius: 10px; padding: 0.55rem 0.75rem; margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.sr-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+
+/* Appointment requests (Technician) */
+.tc-ap-summary { border: 1px solid var(--ws-accent-border); border-radius: 14px; padding: 0.9rem 1rem; background: #fff; display: grid; gap: 0.8rem; }
+.tc-ap-summary-head { display: flex; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; align-items: flex-start; }
+.tc-ap-summary h4 { margin: 0.1rem 0 0; font-size: 1.15rem; }
+.tc-ap-facts { margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0.6rem; }
+.tc-ap-facts div { background: var(--ws-accent-soft); border-radius: 10px; padding: 0.5rem 0.7rem; }
+.tc-ap-facts dt { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: #5b6275; }
+.tc-ap-facts dd { margin: 0.1rem 0 0; font-weight: 600; overflow-wrap: anywhere; }
+.tc-ap-quote { border-left: 4px solid var(--ws-accent-border); padding: 0.1rem 0 0.1rem 0.75rem; }
+.tc-ap-quote h5 { margin: 0 0 0.2rem; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: #5b6275; }
+.tc-ap-quote p { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.tc-ap-quote-reply { border-left-color: var(--ws-accent); background: var(--ws-accent-soft); border-radius: 0 10px 10px 0; padding: 0.5rem 0.75rem; }
+
+.tc-ap-check { display: grid; gap: 0.5rem; justify-items: start; }
+.tc-ap-check .ws-callout { margin: 0; width: 100%; }
+.tc-ap-confirm.is-selected, .tc-ap-choice.tc-ap-confirm.is-selected { border-color: #1b7f4b; background: #eaf7ef; }
+.tc-ap-reject.is-selected { border-color: #b3261e; background: #fdeceb; }
+.tc-ap-request_info.is-selected { border-color: #b26a00; background: #fff4e0; }
+.tc-ap-refer.is-selected { border-color: #4a4fb3; background: #eeeefc; }
+
+/* Patient-facing message vs. internal case notes: visibly different on purpose */
+.tc-ap-section { margin: 0; padding: 0.75rem 1rem 1rem; border-radius: 14px; border: 1px solid; min-width: 0; }
+.tc-ap-section legend { padding: 0 0.4rem; font-weight: 700; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.tc-ap-patient { background: #f1f8ff; border-color: #b9d7f5; }
+.tc-ap-internal { background: #fff7e0; border-color: #f0d68f; }
+.tc-ap-pill { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 700; border-radius: 999px; padding: 0.1rem 0.55rem; }
+.tc-ap-pill-patient { background: #d6e9fb; color: #0d4a80; }
+.tc-ap-pill-internal { background: #f9e7ae; color: #7a4f00; }
+.tc-guardrail-line { margin: 0.35rem 0 0; font-size: 0.82rem; opacity: 0.85; }

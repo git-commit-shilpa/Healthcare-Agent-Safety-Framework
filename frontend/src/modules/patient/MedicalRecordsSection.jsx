@@ -17,13 +17,12 @@ import {
   describeApprovalStatus,
   describeDecision,
   describeSubmissionError,
-  findBlockingRequest,
   formatDateTime,
   parseSubmissionResponse,
   validateProposedTreatment,
 } from "./patientCorrection.js";
 
-const historyPath = "/dashboard/patient/history";
+const historyPath = "/dashboard/patient/requests";
 
 function SubmissionResult({ result }) {
   const resultRef = useRef(null);
@@ -36,12 +35,20 @@ function SubmissionResult({ result }) {
     return (
       <div className="ws-callout ws-callout-success" ref={resultRef} role="status" tabIndex={-1}>
         <strong>Correction request #{result.requestId} submitted</strong>
-        <p>
-          It is <Badge tone="pending">Pending review</Badge> by your assigned
-          Physician. Your medical record has not been changed and will only
-          change if the Physician approves the request.
-        </p>
-        <Link className="ws-link-button" to={historyPath}>Track it in Request History</Link>
+        {result.withCareTeam ? (
+          <p>
+            It is <Badge tone="pending">With your care team</Badge>, who check it first.
+            Your assigned Physician reviews it if clinical authorization is needed. Your medical record has not
+            been changed and will only change if the Physician approves the request.
+          </p>
+        ) : (
+          <p>
+            It is <Badge tone="pending">Pending review</Badge> by your assigned
+            Physician. Your medical record has not been changed and will only
+            change if the Physician approves the request.
+          </p>
+        )}
+        <Link className="ws-link-button" to={historyPath}>Track it in Requests</Link>
       </div>
     );
   }
@@ -52,41 +59,13 @@ function SubmissionResult({ result }) {
       <strong>{result.title}</strong>
       <p>{result.message}</p>
       {(result.outcome === "uncertain" || result.outcome === "conflict") && (
-        <Link className="ws-link-button" to={historyPath}>Open Request History</Link>
+        <Link className="ws-link-button" to={historyPath}>Open Requests</Link>
       )}
     </div>
   );
 }
 
-function CorrectionGate({ historyState, onRetryHistory }) {
-  if (historyState.status === "loading") {
-    return <LoadingMessage>Checking for requests already in review…</LoadingMessage>;
-  }
-  if (historyState.status === "error") {
-    return (
-      <ErrorMessage
-        message="We couldn't check whether you already have a request in review, so new corrections are paused. Reload your requests to continue."
-        onRetry={onRetryHistory}
-        retryLabel="Reload requests"
-      />
-    );
-  }
-  const blocking = historyState.status === "ready" ? findBlockingRequest(historyState.items) : null;
-  if (!blocking) return null;
-
-  return (
-    <div className="ws-callout ws-callout-info" role="status">
-      <strong>Request #{blocking.request_id} is still in review</strong>
-      <p>
-        You can submit a new correction after your Physician has reviewed it.
-        {blocking.created_at && <> It was submitted {formatDateTime(blocking.created_at)}.</>}
-      </p>
-      <Link className="ws-link-button" to={historyPath}>View request status</Link>
-    </div>
-  );
-}
-
-function CorrectionForm({ session, currentTreatment, historyState, onSubmitted, onRetryHistory }) {
+function CorrectionForm({ session, currentTreatment, onSubmitted }) {
   const [step, setStep] = useState("edit");
   const [proposal, setProposal] = useState("");
   const [validationError, setValidationError] = useState("");
@@ -100,9 +79,8 @@ function CorrectionForm({ session, currentTreatment, historyState, onSubmitted, 
     if (step === "review") reviewHeadingRef.current?.focus();
   }, [step]);
 
-  const historyAllowsSubmission =
-    historyState.status === "forbidden" ||
-    (historyState.status === "ready" && !findBlockingRequest(historyState.items));
+  // A patient may have several correction requests open at once, so submission is never gated on history.
+  const historyAllowsSubmission = true;
 
   function handleReview(event) {
     event.preventDefault();
@@ -127,7 +105,7 @@ function CorrectionForm({ session, currentTreatment, historyState, onSubmitted, 
       if (!response) {
         throw Object.assign(new Error("Unexpected confirmation."), { kind: "invalid" });
       }
-      setResult({ type: "success", requestId: response.request_id });
+      setResult({ type: "success", requestId: response.request_id, withCareTeam: response.approval_status === null });
       setProposal("");
       setValidationError("");
       onSubmitted();
@@ -147,8 +125,6 @@ function CorrectionForm({ session, currentTreatment, historyState, onSubmitted, 
   return (
     <div className="ws-stack">
       {result && <SubmissionResult result={result} />}
-
-      <CorrectionGate historyState={historyState} onRetryHistory={onRetryHistory} />
 
       {historyAllowsSubmission && step === "edit" && (
         <form className="ws-form" noValidate onSubmit={handleReview}>
@@ -202,7 +178,7 @@ function CorrectionForm({ session, currentTreatment, historyState, onSubmitted, 
           </dl>
           <ul className="ws-points">
             <li>This sends a request to your assigned Physician. It does not change your record.</li>
-            <li>You can't submit another treatment correction until this one is reviewed.</li>
+            <li>You can track each request, and submit more, under Requests.</li>
           </ul>
           <div className="ws-form-actions">
             <button
@@ -327,8 +303,6 @@ export default function PatientRecordsPage() {
               {useClassicFallback && (
                 <CorrectionForm
                   currentTreatment={recordState.record.treatment}
-                  historyState={historyState}
-                  onRetryHistory={refreshHistory}
                   onSubmitted={refreshHistory}
                   session={session}
                 />

@@ -14,6 +14,7 @@ const iconContent = {
   history: <><path d="M4.5 8.5A8 8 0 1 1 4 13" /><path d="M4.5 4.5v4h4m3.5-.5v5l3 2" /></>,
   profile: <><circle cx="12" cy="8" r="3.5" /><path d="M5 20a7 7 0 0 1 14 0" /></>,
   pulse: <><path d="M3.5 12h4l2-5 4 10 2-5h5" /></>,
+  calendar: <><rect x="3.5" y="5" width="17" height="15.5" rx="2" /><path d="M8 3v4m8-4v4M3.5 10h17M8 14h.01M12 14h.01M16 14h.01M8 17.5h.01M12 17.5h.01" /></>,
   pending: <><circle cx="12" cy="12" r="8.5" /><path d="M12 7.5V12l3 2" /></>,
   escalate: <><path d="M12 3 19 6v5c0 4.6-2.8 8.1-7 10-4.2-1.9-7-5.4-7-10V6l7-3Z" /><path d="M12 8v4m0 3h.01" /></>,
   arrow: <><path d="M5 12h14m-5-5 5 5-5 5" /></>,
@@ -114,7 +115,7 @@ export function WorkspaceShell({
         <p className="ws-app-title">Healthcare Agent Safety Framework</p>
         <p className="ws-nav-label">{workspaceLabel}</p>
         <nav className="ws-nav" aria-label={`${roleLabel} pages`}>
-          {workspacePages[role].map((page) => (
+          {workspacePages[role].filter((page) => !page.hidden).map((page) => (
             <NavLink
               className={({ isActive }) => `ws-nav-link${isActive ? " is-active" : ""}`}
               key={page.path}

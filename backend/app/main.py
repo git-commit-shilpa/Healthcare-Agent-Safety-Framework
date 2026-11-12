@@ -247,7 +247,22 @@ class PatientMedicalRecordResponse(BaseModel):
 class PatientCorrectionRequestResponse(BaseModel):
     request_id: int
     guardrail_decision: Literal["Allow", "Block", "Escalate"]
-    approval_status: Literal["Pending", "Approved", "Rejected"]
+    # Migration 015: a new correction first goes to the care team, so no Physician approval exists yet (None).
+    approval_status: Literal["Pending", "Approved", "Rejected"] | None = None
+    review_stage: Literal["with_care_team", "with_physician"] | None = None
+    # Added by migration 014: whether a Technician coordination task was created ("unassigned" = none available;
+    # the Physician review is unaffected). None when the database function predates 014.
+    coordination: Literal["assigned", "unassigned"] | None = None
+
+
+class PatientCorrectionCoordination(BaseModel):
+    """What the Patient may see of the care team's coordination. Never notes, never who, never correction text."""
+
+    task_id: int
+    status: str
+    status_label: str
+    patient_message: str | None = None
+    can_add_info: bool
 
 
 CorrectionStatusIssue = Literal[
@@ -265,9 +280,12 @@ class PatientCorrectionHistoryItem(BaseModel):
     guardrail_decision: Literal["Allow", "Block", "Escalate"] | None
     approval_status: Literal["Pending", "Approved", "Rejected"] | None
     reviewed_at: str | None
+    # Patient-safe stage: where the request is right now (migration 015 adds the care-team stages).
+    review_stage: Literal["with_care_team", "needs_reply", "with_physician", "approved", "rejected", "declined"] | None = None
     # Set when the stored records are inconsistent; the request is then shown
     # as needing attention instead of being given an assumed status.
     status_issue: CorrectionStatusIssue | None = None
+    coordination: PatientCorrectionCoordination | None = None
 
 
 class PatientCorrectionHistoryResponse(BaseModel):
@@ -1036,9 +1054,26 @@ async def _load_correction_approvals(
     return approvals
 
 
+def _review_stage(approval_status: str | None, coordination: Any) -> str | None:
+    if approval_status == "Approved":
+        return "approved"
+    if approval_status == "Rejected":
+        return "rejected"
+    if approval_status == "Pending":
+        return "with_physician"
+    if coordination is None:
+        return None
+    if coordination.status == "Declined":
+        return "declined"
+    if coordination.status == "On Hold":
+        return "needs_reply"
+    return "with_care_team"
+
+
 def _correction_history_item(
     request: dict[str, Any],
     approvals: list[dict[str, Any]],
+    coordination: Any = None,
 ) -> PatientCorrectionHistoryItem:
     issue: CorrectionStatusIssue | None = None
 
@@ -1054,7 +1089,10 @@ def _correction_history_item(
     approval_status: str | None = None
     reviewed_at: str | None = None
     if not approvals:
-        issue = issue or "missing_approval"
+        # Technician-first (015): no approval is normal while the care team has the request. Without a coordination
+        # task it is still an inconsistency and is shown as needing attention.
+        if coordination is None:
+            issue = issue or "missing_approval"
     elif len(approvals) > 1:
         issue = issue or "multiple_approvals"
     else:
@@ -1085,6 +1123,7 @@ def _correction_history_item(
         approval_status=approval_status,
         reviewed_at=reviewed_at,
         status_issue=issue,
+        review_stage=None if issue is not None else _review_stage(approval_status, coordination),
     )
 
 
@@ -1106,8 +1145,28 @@ async def _blocking_correction_request_id(user_id: int) -> int | None:
         request_ids,
         unavailable_detail=CORRECTION_UNAVAILABLE_DETAIL,
     )
+    declined: set[int] = set()
+    if any(not approvals.get(request_id) for request_id in request_ids):
+        # Technician-first (015): a request with no approval is "closed" only if the care team declined it.
+        # Fails closed: if the tasks cannot be read, nothing is submitted.
+        task_rows = await _patient_service_rows(
+            "technician_tasks",
+            {
+                "select": "task_id,status,approval_request_id",
+                "requested_by": f"eq.{user_id}",
+                "category": "eq.record_correction",
+                "approval_request_id": f"in.({','.join(str(i) for i in request_ids)})",
+            },
+            unavailable_detail=CORRECTION_UNAVAILABLE_DETAIL,
+        )
+        declined = {
+            r["approval_request_id"] for r in task_rows
+            if r.get("status") in ("Declined", "Cancelled") and isinstance(r.get("approval_request_id"), int)
+        }
     for request_id in request_ids:
         request_approvals = approvals.get(request_id, [])
+        if not request_approvals and request_id in declined:
+            continue
         if len(request_approvals) != 1 or request_approvals[0].get("status") not in {
             "Approved",
             "Rejected",
@@ -1138,12 +1197,28 @@ async def get_patient_correction_requests(
         [row["request_id"] for row in requests],
         unavailable_detail=CORRECTION_HISTORY_UNAVAILABLE_DETAIL,
     )
-    return PatientCorrectionHistoryResponse(
-        items=[
-            _correction_history_item(row, approvals.get(row["request_id"], []))
-            for row in requests
-        ]
-    )
+    coordination = await _correction_coordination(user.user_id, [row["request_id"] for row in requests])
+    items = []
+    for row in requests:
+        item = _correction_history_item(row, approvals.get(row["request_id"], []), coordination.get(row["request_id"]))
+        item.coordination = coordination.get(row["request_id"])
+        items.append(item)
+    return PatientCorrectionHistoryResponse(items=items)
+
+
+async def _correction_coordination(user_id: int, request_ids: list[int]) -> dict[int, PatientCorrectionCoordination]:
+    """Best effort and read-only: corrections keep working (without this extra) if it cannot be loaded."""
+    try:
+        from app.technician.features import service_requests_enabled
+
+        if not service_requests_enabled() or not request_ids:
+            return {}
+        from app.service_requests import service as service_requests  # late import: it imports this module
+
+        return await service_requests.correction_coordination(user_id, request_ids)
+    except Exception:  # noqa: BLE001 - the correction history itself must never fail because of the extra
+        logger.warning("Correction coordination status is unavailable; showing corrections without it.")
+        return {}
 
 
 @app.post(
@@ -1220,18 +1295,8 @@ async def _submit_correction(
             detail="The proposed treatment must contain 1 to 2000 characters.",
         )
 
-    # Fails closed: if existing requests cannot be checked, nothing is submitted.
-    blocking_request_id = await _blocking_correction_request_id(user.user_id)
-    if blocking_request_id is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Correction request #{blocking_request_id} is still awaiting "
-                "Physician review. You can submit a new correction after it "
-                "has been reviewed."
-            ),
-        )
-
+    # A patient may have any number of correction requests open at once (demo requirement);
+    # there is deliberately no one-pending-request pre-check here.
     try:
         service_key = _service_role_key()
         response = await _request_supabase(
@@ -1273,15 +1338,19 @@ async def _submit_correction(
     if not response.is_success:
         error_code = ""
         error_message = ""
+        error_reason = ""
         try:
             rpc_error = response.json()
             if isinstance(rpc_error, dict):
                 code = rpc_error.get("code")
                 message = rpc_error.get("message")
+                reason = rpc_error.get("details")
                 if isinstance(code, str):
                     error_code = code
                 if isinstance(message, str):
                     error_message = message
+                if isinstance(reason, str):
+                    error_reason = reason
         except ValueError:
             pass
 
@@ -1298,13 +1367,21 @@ async def _submit_correction(
                 status_code=504,
                 detail=CORRECTION_UNCONFIRMED_DETAIL,
             )
+        if error_code == "PT422" and error_reason == "no_eligible_technician":
+            # Technician-first (015): fail closed. Never routed to the Physician, nothing was written.
+            await _insert_chat_audit(user, "patient.correction.not_accepted", {"reason": "no_eligible_technician"})
+            raise HTTPException(
+                status_code=409,
+                detail="No technician is currently available for your care team, so your correction request "
+                       "could not be sent. Nothing was submitted. Please contact your care team.",
+            )
         if error_code == "PT409":
             # Raised by the database function (migration 007) when a correction
             # request for this Patient is already awaiting review.
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "A correction request is already awaiting Physician review. "
+                    "A correction request is already awaiting review. "
                     "You can submit a new correction after it has been reviewed."
                 ),
             )
@@ -1347,7 +1424,9 @@ async def _submit_correction(
         or not isinstance(result.get("request_id"), int)
         or isinstance(result.get("request_id"), bool)
         or result.get("guardrail_decision") != "Escalate"
-        or result.get("approval_status") != "Pending"
+        # 015: no approval yet (None) while the care team reviews; a pre-015 database function still says Pending.
+        or result.get("approval_status") not in (None, "Pending")
+        or (result.get("approval_status") is None and result.get("coordination") != "assigned")
     ):
         logger.error("Patient correction RPC returned an unexpected response shape.")
         raise HTTPException(
@@ -1358,7 +1437,9 @@ async def _submit_correction(
     return PatientCorrectionRequestResponse(
         request_id=result["request_id"],
         guardrail_decision="Escalate",
-        approval_status="Pending",
+        approval_status=result.get("approval_status"),
+        review_stage="with_physician" if result.get("approval_status") == "Pending" else "with_care_team",
+        coordination=result.get("coordination") if result.get("coordination") in ("assigned", "unassigned") else None,
     )
 
 
@@ -1436,8 +1517,9 @@ CHAT_TURN_BUDGET_SECONDS = 85
 
 CHAT_STATE_INVALID_DETAIL = "This conversation step is no longer valid. Please start again."
 CHAT_OFFER_REPLY = (
-    "I can't submit corrections from this chat, but I can help you raise a correction request "
-    "for your assigned Physician to review. Would you like to raise a correction request?"
+    "I can't submit corrections from this chat, but I can help you raise a correction request. "
+    "Your care team checks it first, and your assigned Physician reviews it if clinical authorization is needed. "
+    "Would you like to raise a correction request?"
 )
 CHAT_DETAILS_REPLY = (
     "Okay. Please enter the proposed correction in the secure request-details box, not in this chat. "
@@ -1457,15 +1539,7 @@ def _chat_notice(reply: str, mode: str, intent: str, token: str | None = None) -
 
 
 async def _correction_offer_or_pending(user: CurrentUser) -> "PatientChatResponse":
-    """Offer help unless a correction already awaits review (the existing pre-check, fail closed)."""
-    blocking_id = await _blocking_correction_request_id(user.user_id)
-    if blocking_id is not None:
-        return _chat_notice(
-            f"Correction request #{blocking_id} is still awaiting Physician review, so another can't be "
-            "submitted until it is reviewed. You can follow it in AI Request History.",
-            "notice",
-            "request_correction",
-        )
+    """Offer help with a correction request (several may be open at once; no pending-request block)."""
     return _chat_notice(
         CHAT_OFFER_REPLY, "offer", "request_correction",
         chat_state.issue_state(user.user_id, chat_state.STEP_OFFERED, session_key=user._session_key or ""),
@@ -1559,15 +1633,6 @@ async def review_assistant_correction(
         raise HTTPException(status_code=409, detail=CHAT_STATE_INVALID_DETAIL) from error
     if step != chat_state.STEP_DETAILS:
         raise HTTPException(status_code=409, detail=CHAT_STATE_INVALID_DETAIL)
-    blocking_id = await _blocking_correction_request_id(user.user_id)
-    if blocking_id is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Correction request #{blocking_id} is still awaiting Physician review. "
-                "You can submit a new correction after it has been reviewed."
-            ),
-        )
     return CorrectionReviewResponse(
         proposed_treatment=payload.proposed_treatment,
         state_token=chat_state.issue_state(
@@ -1576,7 +1641,8 @@ async def review_assistant_correction(
         ),
         expires_in_seconds=chat_state.STATE_TTL_SECONDS,
         notice=(
-            "This does not change your record. Your assigned Physician will review it. "
+            "This does not change your record. Your care team checks it first, and your assigned Physician "
+            "reviews it if clinical authorization is needed. "
             "Press Confirm to submit this request."
         ),
     )
@@ -1728,8 +1794,10 @@ async def _run_chat_turn_inner(payload: PatientChatRequest, user: CurrentUser) -
     greeting = canned_reply(payload.message)
     if greeting is not None:  # fixed, non-actionable reply; no model call
         return PatientChatResponse(reply=greeting.reply, decision="Allow", intent="greeting", mode="greeting")
-    verdict = safety_rules.screen(payload.message)
-    if verdict is not None:  # deterministic: emergencies and forbidden requests never reach a model
+    # Deterministic: emergencies and forbidden requests (including another person's private information)
+    # never reach a model or a record lookup. The patient's own name only exempts their own name.
+    verdict = safety_rules.screen(payload.message, own_name=user.name)
+    if verdict is not None:
         return PatientChatResponse(
             reply=verdict.reply,
             decision=verdict.decision,
@@ -2639,3 +2707,18 @@ async def bootstrap_session(
     if user.role == Role.ADMIN:
         admin_overview = await _build_admin_overview(user)
     return AuthBootstrapResponse(user=user, admin_overview=admin_overview)
+
+
+# Technician portal routes. Imported last so the technician package can use
+# the dependencies defined above without a circular-import problem.
+from app.technician.errors import register_error_handlers  # noqa: E402
+from app.technician.routes import router as technician_router  # noqa: E402
+from app.service_requests.routes import router as service_requests_router  # noqa: E402
+from app.scheduling.routes import router as appointments_router  # noqa: E402
+from app.scheduling.physician_routes import router as physician_schedule_router  # noqa: E402
+
+register_error_handlers(app)
+app.include_router(technician_router)
+app.include_router(service_requests_router)
+app.include_router(appointments_router)
+app.include_router(physician_schedule_router)

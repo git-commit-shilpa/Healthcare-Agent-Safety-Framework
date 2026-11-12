@@ -1402,3 +1402,22 @@
   border-style: dashed;
   opacity: 0.92;
 }
+
+/* Secure forms inside the dark assistant panel (correction details).
+   .assistant-command-panel redefines --ws-text as a light colour for dark surfaces, but .ws-form inputs keep a
+   white background, which made typed text near-invisible. Pin dark text on the white field (contrast ~16:1). */
+.assistant-command-panel .ws-form :is(input, select, textarea) {
+  background: #fff;
+  color: #1c2541;
+  caret-color: #1c2541;
+}
+
+.assistant-command-panel .ws-form :is(input, textarea)::placeholder {
+  color: #5b6275;
+  opacity: 1;
+}
+
+.assistant-command-panel .ws-form :is(input, select, textarea):focus {
+  color: #1c2541;
+  background: #fff;
+}

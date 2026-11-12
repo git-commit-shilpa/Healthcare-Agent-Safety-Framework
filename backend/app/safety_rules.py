@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+from app import third_party_access
+
 Mode = Literal["notice", "refusal"]
 
 
@@ -150,8 +152,31 @@ def _normalise(message: str) -> str:
     return " ".join(message.replace("’", "'").casefold().split())
 
 
-def screen(message: str) -> SafetyVerdict | None:
-    """Return a fixed verdict for a message that must not reach the model, else None."""
+def _other_patient_access(text: str, message: str, own_name: str | None) -> bool:
+    """True when the message asks for another person's private information (see third_party_access)."""
+    if third_party_access.is_third_party_record_request(message, own_name):
+        return True
+    other = _OTHER_PERSON.search(text)
+    named = _NAMED_PERSON.search(message)
+    if not ((other or named) and _DATA_NOUN.search(text)):
+        return False
+    # An explicit fictional example ("explain asthma using a fictional patient named Alex") names a
+    # made-up person and asks for education, not a record. Anything stronger still blocks.
+    if (
+        third_party_access.is_fictional_framing(message)
+        and third_party_access.classify(message, own_name) != "strong"
+        and (named or re.fullmatch(r"patients? named", other.group(0)))
+    ):
+        return False
+    return True
+
+
+def screen(message: str, own_name: str | None = None) -> SafetyVerdict | None:
+    """Return a fixed verdict for a message that must not reach the model, else None.
+
+    own_name is the signed-in patient's own name (from the authenticated session). It only stops the
+    patient's own name from being read as a third party; it never selects whose data is read.
+    """
     text = _normalise(message)
     if not text:
         return None
@@ -161,7 +186,7 @@ def screen(message: str) -> SafetyVerdict | None:
     ):
         return SafetyVerdict("emergency", "Escalate", "emergency_detected", EMERGENCY_REPLY, "notice")
 
-    if (_OTHER_PERSON.search(text) or _NAMED_PERSON.search(message)) and _DATA_NOUN.search(text):
+    if _other_patient_access(text, message, own_name):
         return SafetyVerdict(
             "other_patient_access", "Block", "other_patient_access", OTHER_PATIENT_REPLY, "refusal"
         )

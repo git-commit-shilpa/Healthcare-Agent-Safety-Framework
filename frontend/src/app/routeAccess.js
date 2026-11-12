@@ -1,20 +1,38 @@
+import { readFeatureFlags } from "./features.js";
+
 /** Pages shown in each role's sidebar. Paths are relative to /dashboard/<role>. */
-export const workspacePages = {
-  admin: [
-    { path: "overview", label: "Overview", icon: "overview" },
-    { path: "users", label: "User access", icon: "users" },
-    { path: "permissions", label: "Role permissions", icon: "permissions" },
-    { path: "ai-requests", label: "AI guardrails", icon: "guardrails" },
-    { path: "audit-logs", label: "Audit trail", icon: "audit" },
-  ],
-  patient: [
-    { path: "overview", label: "Overview", icon: "overview" },
-    { path: "records", label: "My Medical Records", icon: "records" },
-    { path: "assistant", label: "Ask AI Assistant", icon: "assistant" },
-    { path: "history", label: "AI Request History", icon: "history" },
-    { path: "profile", label: "My Profile", icon: "profile" },
-  ],
-};
+export function buildWorkspacePages(flags = {}) {
+  return {
+    admin: [
+      { path: "overview", label: "Overview", icon: "overview" },
+      { path: "users", label: "User access", icon: "users" },
+      { path: "permissions", label: "Role permissions", icon: "permissions" },
+      { path: "ai-requests", label: "AI guardrails", icon: "guardrails" },
+      { path: "audit-logs", label: "Audit trail", icon: "audit" },
+    ],
+    patient: [
+      { path: "overview", label: "Overview", icon: "overview" },
+      { path: "records", label: "My Medical Records", icon: "records" },
+      { path: "assistant", label: "Ask AI Assistant", icon: "assistant" },
+      // Appointments stay separate from every other request type.
+      ...(flags.appointments ? [{ path: "appointments", label: "Appointments", icon: "calendar" }] : []),
+      // One page for service requests and medical-record corrections. It replaces the separate
+      // "Service Requests" and "AI Request History" items (their old URLs redirect here).
+      { path: "requests", label: "Requests", icon: "history" },
+      { path: "profile", label: "My Profile", icon: "profile" },
+    ],
+    technician: [
+      { path: "overview", label: "Overview", icon: "overview" },
+      { path: "patients", label: "Assigned Patients", icon: "users" },
+      ...(flags.serviceRequests ? [{ path: "tasks", label: "Tasks", icon: "pending" }] : []),
+      ...(flags.serviceRequests && flags.appointments
+        ? [{ path: "scheduling", label: "Scheduling Requests", icon: "calendar" }]
+        : []),
+    ],
+  };
+}
+
+export const workspacePages = buildWorkspacePages(readFeatureFlags());
 
 export function dashboardPath(role, page = "") {
   return page ? `/dashboard/${role}/${page}` : `/dashboard/${role}`;

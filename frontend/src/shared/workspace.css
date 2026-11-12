@@ -129,6 +129,69 @@
   --ws-tone-4-text: #13703a;
 }
 
+.ws-theme-technician {
+  /* Operations workspace: deep indigo, cool blue, soft amber accents */
+  --ws-page-bg: #f2f4fb;
+  --ws-page-glow-1: rgb(129 140 248 / 18%);
+  --ws-page-glow-2: rgb(125 211 252 / 14%);
+  --ws-sidebar-bg:
+    radial-gradient(circle at 0 0, rgb(129 140 248 / 26%), transparent 42%),
+    radial-gradient(circle at 100% 100%, rgb(125 211 252 / 18%), transparent 48%),
+    linear-gradient(175deg, #0d1240 0%, #1a2268 55%, #123a78 100%);
+  --ws-sidebar-border: #1d2870;
+  --ws-sidebar-text: #eceefe;
+  --ws-sidebar-muted: #b4bbef;
+  --ws-nav-hover: rgb(165 180 252 / 14%);
+  --ws-nav-active-bg: linear-gradient(95deg, rgb(129 140 248 / 30%), rgb(125 211 252 / 22%));
+  --ws-nav-active-border: rgb(165 180 252 / 48%);
+  --ws-nav-active-bar: #a5b4fc;
+  --ws-nav-icon: #a9b3f2;
+  --ws-nav-active-icon: #c7d2fe;
+  --ws-avatar-bg: linear-gradient(135deg, #a5b4fc, #7dd3fc);
+  --ws-avatar-text: #0d1240;
+  --ws-logo-start: #818cf8;
+  --ws-logo-end: #38bdf8;
+  --ws-accent: #4338ca;
+  --ws-accent-hover: #3730a3;
+  --ws-accent-text: #3b32b8;
+  --ws-accent-soft: #e8e9fb;
+  --ws-accent-border: #c9ccf5;
+  --ws-focus: #4338ca;
+  --ws-focus-dark: #c7d2fe;
+  --ws-hero-bg:
+    radial-gradient(ellipse at 82% 12%, rgb(129 140 248 / 42%), transparent 40%),
+    radial-gradient(ellipse at 100% 100%, rgb(251 191 36 / 30%), transparent 40%),
+    linear-gradient(115deg, #0d1240 0%, #232d82 52%, #14578f 100%);
+  --ws-hero-eyebrow: #c7d2fe;
+  --ws-hero-text: #e6e9fd;
+  --ws-hero-btn-text: #1e2670;
+  --ws-hero-line: rgb(199 210 254 / 70%);
+  --ws-hero-glyph: #c7d2fe;
+  --ws-node-1: #a5b4fc;
+  --ws-node-2: #fcd34d;
+  --ws-node-3: #7dd3fc;
+  --ws-node-4: #fde68a;
+  --ws-role-pill-bg: #e8e9fb;
+  --ws-role-pill-border: #c9ccf5;
+  --ws-role-pill-text: #2f2a96;
+  --ws-tone-1-bg: linear-gradient(135deg, #e8e9fb, #f5f6fe);
+  --ws-tone-1-border: #c9ccf5;
+  --ws-tone-1-accent: #6366f1;
+  --ws-tone-1-text: #3b32b8;
+  --ws-tone-2-bg: linear-gradient(135deg, #e3f1fc, #f3f9fe);
+  --ws-tone-2-border: #c4dff5;
+  --ws-tone-2-accent: #38a1e8;
+  --ws-tone-2-text: #1a5f95;
+  --ws-tone-3-bg: linear-gradient(135deg, #fff3da, #fffaf0);
+  --ws-tone-3-border: #f5dfa8;
+  --ws-tone-3-accent: #f59e0b;
+  --ws-tone-3-text: #8a5a05;
+  --ws-tone-4-bg: linear-gradient(135deg, #e4f7ee, #f3fcf8);
+  --ws-tone-4-border: #bfe6d1;
+  --ws-tone-4-accent: #34c58a;
+  --ws-tone-4-text: #146c46;
+}
+
 .ws-tone-1 { --ws-tone-bg: var(--ws-tone-1-bg); --ws-tone-border: var(--ws-tone-1-border); --ws-tone-accent: var(--ws-tone-1-accent); --ws-tone-text: var(--ws-tone-1-text); }
 .ws-tone-2 { --ws-tone-bg: var(--ws-tone-2-bg); --ws-tone-border: var(--ws-tone-2-border); --ws-tone-accent: var(--ws-tone-2-accent); --ws-tone-text: var(--ws-tone-2-text); }
 .ws-tone-3 { --ws-tone-bg: var(--ws-tone-3-bg); --ws-tone-border: var(--ws-tone-3-border); --ws-tone-accent: var(--ws-tone-3-accent); --ws-tone-text: var(--ws-tone-3-text); }

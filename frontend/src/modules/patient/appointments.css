@@ -1,0 +1,55 @@
+/* Patient "Appointments" page. Uses the per-role theme variables from workspace.css. */
+.ap-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 1.25rem; align-items: start; }
+@media (max-width: 960px) { .ap-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* Step indicator */
+.ap-steps { list-style: none; margin: 0 0 0.25rem; padding: 0; display: flex; flex-wrap: wrap; gap: 0.4rem 0.9rem; font-size: 0.85rem; color: #5b6275; }
+.ap-step { display: inline-flex; align-items: center; gap: 0.4rem; }
+.ap-step-number { display: inline-grid; place-items: center; width: 1.45rem; height: 1.45rem; border-radius: 50%; border: 1px solid var(--ws-accent-border); background: #fff; font-size: 0.75rem; font-weight: 700; }
+.ap-step.is-current { color: var(--ws-accent-text); font-weight: 700; }
+.ap-step.is-current .ap-step-number { background: var(--ws-accent); border-color: var(--ws-accent); color: #fff; }
+.ap-step.is-done .ap-step-number { background: var(--ws-accent-soft); color: var(--ws-accent-text); }
+
+/* Time slots */
+.ap-times { border: 1px solid var(--ws-accent-border); border-radius: 14px; padding: 0.75rem 1rem 1rem; margin: 0; min-width: 0; display: grid; gap: 0.6rem; }
+.ap-times legend { padding: 0 0.4rem; font-weight: 700; font-size: 0.9rem; }
+.ap-times:disabled { opacity: 0.7; }
+.ap-slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr)); gap: 0.5rem; }
+.ap-slot { position: relative; display: block; cursor: pointer; }
+.ap-slot input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.ap-slot span { display: block; text-align: center; padding: 0.55rem 0.5rem; border: 1px solid var(--ws-accent-border); border-radius: 10px; background: #fff; font-weight: 600; font-size: 0.9rem; }
+.ap-slot:hover span { background: var(--ws-accent-soft); }
+.ap-slot.is-selected span { background: var(--ws-accent); border-color: var(--ws-accent); color: #fff; }
+.ap-slot input:focus-visible + span { outline: 3px solid var(--ws-focus); outline-offset: 2px; }
+
+/* Review and confirmation */
+.ap-review, .ap-done { display: grid; gap: 0.85rem; }
+.ap-review h3, .ap-done h3 { margin: 0; }
+.ap-summary { margin: 0; display: grid; gap: 0.5rem; border: 1px solid var(--ws-accent-border); border-radius: 14px; padding: 0.85rem 1rem; background: var(--ws-accent-soft); }
+.ap-summary div { display: grid; grid-template-columns: 8rem minmax(0, 1fr); gap: 0.5rem; }
+.ap-summary dt { font-weight: 700; color: var(--ws-accent-text); }
+.ap-summary dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+@media (max-width: 480px) { .ap-summary div { grid-template-columns: minmax(0, 1fr); gap: 0.1rem; } }
+.ap-confirm { display: flex; gap: 0.6rem; align-items: flex-start; font-weight: 600; }
+.ap-confirm input { margin-top: 0.25rem; }
+
+/* Tabs and cards */
+.ap-tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.85rem; }
+.ap-tab { border: 1px solid var(--ws-accent-border); background: #fff; border-radius: 999px; padding: 0.4rem 0.85rem; font: inherit; font-size: 0.88rem; font-weight: 600; cursor: pointer; }
+.ap-tab:hover { background: var(--ws-accent-soft); }
+.ap-tab.is-active { background: var(--ws-accent); border-color: var(--ws-accent); color: #fff; }
+.ap-tab:focus-visible { outline: 3px solid var(--ws-focus); outline-offset: 2px; }
+.ap-count { display: inline-block; min-width: 1.3rem; margin-left: 0.2rem; padding: 0 0.35rem; border-radius: 999px; background: rgba(0, 0, 0, 0.08); text-align: center; font-size: 0.78rem; }
+.ap-tab.is-active .ap-count { background: rgba(255, 255, 255, 0.25); }
+.ap-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.75rem; }
+.ap-card { border: 1px solid var(--ws-accent-border); border-radius: 14px; padding: 0.85rem 1rem; background: #fff; display: grid; gap: 0.5rem; }
+.ap-card-top { display: flex; justify-content: space-between; gap: 0.6rem; flex-wrap: wrap; align-items: flex-start; }
+.ap-card h3 { margin: 0; font-size: 1rem; }
+.ap-when { margin: 0.1rem 0 0; font-weight: 700; }
+.ap-meta { color: #5b6275; font-size: 0.85rem; margin: 0; overflow-wrap: anywhere; }
+.ap-message { background: var(--ws-accent-soft); border-radius: 10px; padding: 0.55rem 0.75rem; margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.ap-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.ap-updates { border-top: 1px dashed var(--ws-accent-border); padding-top: 0.6rem; }
+.ap-timeline { list-style: none; margin: 0; padding: 0 0 0 0.9rem; border-left: 3px solid var(--ws-accent-border); display: grid; gap: 0.6rem; }
+.ap-timeline p { margin: 0.2rem 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.ap-time { color: #5b6275; font-size: 0.82rem; }

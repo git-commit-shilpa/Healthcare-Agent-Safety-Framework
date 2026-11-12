@@ -25,6 +25,11 @@ class ActionSpec:
     risk: Risk
 
 
+# Intents the model may propose that are NEVER permitted for any patient. They are not in the allowlist
+# below; decide() turns them into an authoritative Block regardless of permissions.
+OTHER_PATIENT_INTENT = "other_patient_access"
+FORBIDDEN_INTENTS = frozenset({OTHER_PATIENT_INTENT})
+
 # Fixed allowlist. There is deliberately no action that updates a medical record.
 ACTION_CATALOGUE: dict[str, ActionSpec] = {
     "explain_process": ActionSpec(permission=ASSISTANT_PERMISSION, risk="low"),
@@ -131,7 +136,7 @@ def parse_proposal(raw: Any) -> IntentProposal | None:
         return None
     if not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
         return None
-    if intent != UNKNOWN_INTENT and intent not in ACTION_CATALOGUE:
+    if intent != UNKNOWN_INTENT and intent not in ACTION_CATALOGUE and intent not in FORBIDDEN_INTENTS:
         return None
     return IntentProposal(intent=intent, confidence=float(confidence))
 
@@ -150,6 +155,10 @@ def decide(
         return GatewayDecision(UNKNOWN_INTENT, "Block", "guardrail_blocked")
     if proposal is None:
         return GatewayDecision(UNKNOWN_INTENT, "Block", "invalid_model_output")
+    if proposal.intent in FORBIDDEN_INTENTS:
+        # Another person's private information: blocked by the gateway whatever the permissions or
+        # confidence, so the displayed decision never depends on the model's wording of a refusal.
+        return GatewayDecision(proposal.intent, "Block", "other_patient_access")
     spec = ACTION_CATALOGUE.get(proposal.intent)
     if spec is None:
         return GatewayDecision(UNKNOWN_INTENT, "Block", "unknown_intent")

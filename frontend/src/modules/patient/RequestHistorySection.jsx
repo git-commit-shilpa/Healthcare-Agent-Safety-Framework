@@ -1,48 +1,92 @@
-import { Link, useOutletContext } from "react-router-dom";
+import { useId, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 
-import { PageHeader } from "../../shared/WorkspaceShell.jsx";
+import { describeError } from "../../shared/taskApi.js";
+
 import {
   Badge,
   ErrorMessage,
   LoadingMessage,
   Panel,
-  RefreshButton,
 } from "../../shared/workspaceUi.jsx";
 import {
   describeApprovalStatus,
-  describeDecision,
   formatDateTime,
+  validateCorrectionReply,
+  MAX_CORRECTION_REPLY,
 } from "./patientCorrection.js";
+import { addRequestInfo } from "./serviceRequestsApi.js";
 
-export default function PatientHistoryPage() {
-  const { historyState, refreshHistory } = useOutletContext();
-  const refreshing = historyState.status === "loading";
+/** The care team's question about a correction, and the patient's answer. Replies are short and not for medical detail. */
+function CoordinationReply({ coordination, token, onDone }) {
+  const [reply, setReply] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const inFlight = useRef(false);
+  const id = useId();
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+    if (inFlight.current) return;
+    const problem = validateCorrectionReply(reply);
+    if (problem) {
+      setError(problem);
+      return;
+    }
+    inFlight.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      await addRequestInfo(token, coordination.task_id, reply);
+      setReply("");
+      await onDone();
+    } catch (requestError) {
+      setError(describeError(requestError));
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
+    }
+  }
 
   return (
-    <>
-      <PageHeader
-        actions={
-          historyState.status !== "forbidden" && (
-            <RefreshButton busy={refreshing} label="Refresh" onClick={refreshHistory} />
-          )
-        }
-        description="Each correction you submit is escalated by the safety framework to your assigned Physician. Follow its review here."
-        eyebrow="YOUR ACTIVITY"
-        icon="history"
-        title="AI Request History"
-      />
+    <form className="ws-form" noValidate onSubmit={handleSubmit}>
+      <div className="ws-field">
+        <label htmlFor={`${id}-reply`}>Your reply to your care team</label>
+        <p className="ws-form-note">
+          Please do not include medical details or repeat your correction. Your care team and your Physician can read this reply.
+        </p>
+        <textarea
+          aria-invalid={Boolean(error)}
+          disabled={busy}
+          id={`${id}-reply`}
+          maxLength={MAX_CORRECTION_REPLY}
+          onChange={(event) => { setReply(event.target.value); setError(""); }}
+          rows={3}
+          value={reply}
+        />
+        <div className="ws-field-meta"><span>{reply.length}/{MAX_CORRECTION_REPLY}</span></div>
+        {error && <p className="ws-field-error" role="alert">{error}</p>}
+      </div>
+      <div className="ws-form-actions">
+        <button className="ws-btn ws-btn-primary" disabled={busy} type="submit">{busy ? "Sending…" : "Send reply"}</button>
+      </div>
+    </form>
+  );
+}
 
+/** Medical-record correction requests (stored separately from service requests). */
+export function CorrectionRequestsPanel({ historyState, refreshHistory, token }) {
+  return (
       <Panel
-        eyebrow="CORRECTION REQUESTS"
+        eyebrow="MEDICAL RECORD CORRECTIONS"
         icon="history"
         subtitle="Newest first. Your proposed text is kept for your Physician's review and is not shown here or in Admin monitoring."
-        title="Your requests"
+        title="Record correction requests"
         titleId="history-title"
         tone={2}
       >
         <div className="ws-legend" aria-label="Status legend">
-          <span><i className="ws-dot-escalate" /> Escalated for Physician review</span>
-          <span><i className="ws-dot-pending" /> Pending review</span>
+          <span><i className="ws-dot-pending" /> Pending Physician review</span>
           <span><i className="ws-dot-allow" /> Approved</span>
           <span><i className="ws-dot-block" /> Rejected</span>
           <span><i className="ws-dot-issue" /> Needs attention</span>
@@ -72,22 +116,33 @@ export default function PatientHistoryPage() {
                 <tr>
                   <th scope="col">Request</th>
                   <th scope="col">Type</th>
-                  <th scope="col">Guardrail decision</th>
                   <th scope="col">Physician review</th>
+                  <th scope="col">Care team</th>
                   <th scope="col">Submitted</th>
                   <th scope="col">Reviewed</th>
                 </tr>
               </thead>
               <tbody>
                 {historyState.items.map((item) => {
-                  const decision = describeDecision(item.guardrail_decision);
                   const approval = describeApprovalStatus(item);
                   return (
                     <tr key={item.request_id}>
                       <td>#{item.request_id}</td>
-                      <td>Treatment correction</td>
-                      <td><Badge tone={decision.tone}>{decision.label}</Badge></td>
+                      <td>Record correction</td>
                       <td><Badge tone={approval.tone}>{approval.label}</Badge></td>
+                      <td>
+                        {item.coordination ? (
+                          <>
+                            <p>{item.coordination.status_label}</p>
+                            {item.coordination.patient_message && item.coordination.patient_message !== item.coordination.status_label && (
+                              <p className="ws-form-note">{item.coordination.patient_message}</p>
+                            )}
+                            {item.coordination.can_add_info && token && (
+                              <CoordinationReply coordination={item.coordination} onDone={refreshHistory} token={token} />
+                            )}
+                          </>
+                        ) : "—"}
+                      </td>
                       <td>{formatDateTime(item.created_at) ?? "—"}</td>
                       <td>{formatDateTime(item.reviewed_at) ?? "Not yet reviewed"}</td>
                     </tr>
@@ -98,6 +153,5 @@ export default function PatientHistoryPage() {
           </div>
         )}
       </Panel>
-    </>
   );
 }

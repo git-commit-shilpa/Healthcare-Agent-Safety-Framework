@@ -16,6 +16,7 @@ from typing import Any
 from app import output_safety
 from app.action_gateway import HEALTH_INTENTS, GatewayDecision
 from app.intent_recognizer import Recognition, RecognizerUnavailableError, _evaluate_log
+from app.safety_rules import OTHER_PATIENT_REPLY
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ SYSTEM_PROMPT = (
     "My Medical Records (view your own record and request a treatment correction, "
     "which is reviewed by your assigned Physician and never changes the record "
     "immediately); AI Request History (the status of your correction requests only); Ask AI Assistant; "
-    "My Profile. Only one correction request can be waiting for review at a time. "
+    "My Profile. "
     "Never give medical advice, diagnosis or treatment suggestions. Never claim to "
     "have changed, approved or submitted anything. You cannot see the user's record."
 )
@@ -62,6 +63,7 @@ REFUSALS = {
     "permission_missing": "Your account doesn't currently have access to that. I can still explain how the portal works.",
     "invalid_model_output": "I didn't quite understand that. Could you rephrase your question?",
     "role_not_permitted": "This assistant is available to patient accounts only.",
+    "other_patient_access": OTHER_PATIENT_REPLY,
 }
 ESCALATION_REPLY = (
     "I can't change or submit corrections from this chat. Correction requests are reviewed by "

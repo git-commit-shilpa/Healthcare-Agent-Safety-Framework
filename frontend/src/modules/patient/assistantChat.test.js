@@ -85,6 +85,16 @@ test("safety decision labels are shown only when explicitly returned by the back
   assert.equal(parse({ reply: "Hello", mode: "answer" }).decision, null);
 });
 
+test("a Technician-first correction is announced as being with the care team", () => {
+  const state = applySubmitted(createInitialState(AT), { request_id: 9, guardrail_decision: "Escalate", approval_status: null, coordination: "assigned" }, AT);
+  const text = state.messages.at(-1).text;
+  assert.match(text, /#9 was submitted/);
+  assert.match(text, /with your care team/);
+  assert.match(text, /reviews it if clinical authorization is needed/);
+  assert.doesNotMatch(text, /Pending review by your assigned Physician/);
+  assert.equal(state.messages.at(-1).link.to, "/dashboard/patient/requests");
+});
+
 test("history responses are validated and restored without correction state", () => {
   const chatId = "fe3a98cb-04f1-4d1f-87ed-1b4c93616d63";
   const chats = parseChatListResponse({
@@ -141,7 +151,7 @@ test("cancellation and resets clear the token and proposal", () => {
 
 test("pointer replies add a navigation link", () => {
   const state = applyChatResponse(createInitialState(AT), parse(chatResponse("pointer", null, "The status is in AI Request History.")), AT);
-  assert.equal(state.messages.at(-1).link.to, "/dashboard/patient/history");
+  assert.equal(state.messages.at(-1).link.to, "/dashboard/patient/requests");
 });
 
 test("pending-request conflict (409) resets the flow and points to Request History", () => {

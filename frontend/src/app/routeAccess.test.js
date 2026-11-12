@@ -58,5 +58,5 @@ test("page lookup ignores other roles and unknown paths", () => {
   assert.equal(pageForPath("patient", "/dashboard/admin/users"), null);
   assert.equal(pageForPath("patient", "/dashboard/patient/unknown"), null);
   assert.equal(pageForPath("admin", "/dashboard/admin"), null);
-  assert.equal(pageForPath("patient", "/dashboard/patient/history/extra").path, "history");
+  assert.equal(pageForPath("patient", "/dashboard/patient/requests/extra").path, "requests");
 });
